@@ -27,172 +27,33 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 모듈 임포트 (디버그 로깅 포함) ──────────────────────────
-import traceback
-import importlib
-
-_import_errors   = {}   # { 모듈명: 에러 메시지 }
-_import_success  = []   # 성공한 모듈 목록
-ML_AVAILABLE     = False
-
-# ── 헬퍼: 단일 심볼 임포트 + 결과 기록 ─────────────────────
-def _try_import(module_path, symbols=None):
-    """
-    module_path : 'core.i18n' 같은 문자열
-    symbols     : ['TRANSLATIONS'] 처럼 가져올 이름 목록 (None 이면 모듈 자체 반환)
-    반환값      : symbols 에 맞는 객체들의 튜플, 실패 시 None (또는 단일 객체)
-    """
-    try:
-        mod = importlib.import_module(module_path)
-        _import_success.append(module_path)
-        if symbols is None:
-            return mod
-        return tuple(getattr(mod, s) for s in symbols)
-    except Exception as exc:
-        _import_errors[module_path] = {
-            "error": str(exc),
-            "type" : type(exc).__name__,
-            "trace": traceback.format_exc(),
-        }
-        return None
-
-# ── 필수 모듈 (하나라도 실패하면 앱 중단) ──────────────────
-_REQUIRED = [
-    ("core.i18n",               ["TRANSLATIONS"]),
-    ("core.rule_check",         ["run_feasibility_check", "MATERIAL_LIMITS"]),
-    ("core.cae_analyzer",       ["analyze_cae", "load_cae_data",
-                                  "generate_sample_cae_csv", "PROCESS_LIMITS"]),
-    ("core.shrink_model",       ["predict_shrinkage_field", "predict_part_dimensions",
-                                  "build_shrink_map_grid", "get_sample_features", "MATERIAL_PVT"]),
-    ("core.inverse_design",     ["run_inverse_design", "build_error_map"]),
-    ("core.model_processor",    ["process_uploaded_model"]),
-    ("core.parting_line_analyzer", ["analyze_parting_line"]),
-    ("core.slide_core_optimizer",  ["optimize_mold_design"]),
-    ("core.flow_csv_generator",    ["generate_flow_csv_from_github"]),
-]
-
-# 결과를 담을 네임스페이스
-TRANSLATIONS = run_feasibility_check = MATERIAL_LIMITS = None
-analyze_cae = load_cae_data = generate_sample_cae_csv = PROCESS_LIMITS = None
-predict_shrinkage_field = predict_part_dimensions = None
-build_shrink_map_grid = get_sample_features = MATERIAL_PVT = None
-run_inverse_design = build_error_map = None
-process_uploaded_model = analyze_parting_line = optimize_mold_design = None
-generate_flow_csv_from_github = None
-train_or_update_model = apply_ml_correction = None
-load_drawing_features_from_csv = generate_cad_macro_script = None
-
-_symbol_map = {}   # 모듈 경로 → 임포트된 심볼 딕셔너리
-for _mod_path, _syms in _REQUIRED:
-    _result = _try_import(_mod_path, _syms)
-    if _result is not None:
-        _symbol_map[_mod_path] = dict(zip(_syms, _result))
-
-# 전역에 풀어쓰기
-for _d in _symbol_map.values():
-    for _k, _v in _d.items():
-        globals()[_k] = _v
-
-# ── 선택적 모듈 ────────────────────────────────────────────
-_ml = _try_import("core.ml_feedback", ["train_or_update_model", "apply_ml_correction"])
-if _ml is not None:
-    train_or_update_model, apply_ml_correction = _ml
-    ML_AVAILABLE = True
-
-_draw = _try_import("core.drawing_sync",
-                    ["load_drawing_features_from_csv", "generate_cad_macro_script"])
-if _draw is not None:
-    load_drawing_features_from_csv, generate_cad_macro_script = _draw
-
-# ── 디버그 패널 출력 ────────────────────────────────────────
-_failed_required = [p for p, _ in _REQUIRED if p in _import_errors]
-MODULES_OK = len(_failed_required) == 0
-
-if _import_errors:
-    st.markdown("---")
-    st.markdown("## 🛠️ Module Import Diagnostic")
-
-    # 요약 테이블
-    summary_rows = []
-    for mod_path, _ in _REQUIRED:
-        if mod_path in _import_errors:
-            err = _import_errors[mod_path]
-            summary_rows.append({
-                "Module": mod_path,
-                "Status": "❌ FAILED",
-                "Error Type": err["type"],
-                "Message": err["error"],
-            })
-        else:
-            summary_rows.append({
-                "Module": mod_path,
-                "Status": "✅ OK",
-                "Error Type": "",
-                "Message": "",
-            })
-    for mod_path in ["core.ml_feedback", "core.drawing_sync"]:
-        if mod_path in _import_errors:
-            err = _import_errors[mod_path]
-            summary_rows.append({
-                "Module": f"{mod_path} (optional)",
-                "Status": "⚠️ SKIP",
-                "Error Type": err["type"],
-                "Message": err["error"],
-            })
-        elif mod_path in _import_success:
-            summary_rows.append({
-                "Module": f"{mod_path} (optional)",
-                "Status": "✅ OK",
-                "Error Type": "",
-                "Message": "",
-            })
-
-    st.dataframe(
-        pd.DataFrame(summary_rows),
-        use_container_width=True,
-        hide_index=True,
+# ── 모듈 임포트 ───────────────────────────────────────────
+try:
+    from core.i18n import TRANSLATIONS
+    from core.rule_check import run_feasibility_check, MATERIAL_LIMITS
+    from core.cae_analyzer import analyze_cae, load_cae_data, generate_sample_cae_csv, PROCESS_LIMITS
+    from core.shrink_model import (
+        predict_shrinkage_field, predict_part_dimensions,
+        build_shrink_map_grid, get_sample_features, MATERIAL_PVT
     )
-
-    # 상세 traceback
-    for mod_path, err_info in _import_errors.items():
-        with st.expander(f"🔍 Traceback: `{mod_path}`", expanded=(mod_path in _failed_required)):
-            st.markdown(f"**Error Type:** `{err_info['type']}`")
-            st.markdown(f"**Message:** {err_info['error']}")
-            st.code(err_info["trace"], language="python")
-
-    # Python 환경 정보
-    with st.expander("🐍 Python Environment Info"):
-        st.markdown(f"**Python version:** `{sys.version}`")
-        st.markdown(f"**sys.path:**")
-        for p in sys.path:
-            st.code(p)
-        st.markdown(f"**current_dir:** `{current_dir}`")
-
-        # core/ 폴더 실제 파일 목록
-        core_dir = os.path.join(current_dir, "core")
-        if os.path.isdir(core_dir):
-            st.markdown(f"**Files in `core/`:**")
-            core_files = sorted(os.listdir(core_dir))
-            st.code("\n".join(core_files))
-        else:
-            st.error(f"❌ `core/` directory not found at: `{core_dir}`")
-            st.markdown("Looking for `core/` in parent directories:")
-            for _parent in [current_dir,
-                            os.path.dirname(current_dir),
-                            os.path.dirname(os.path.dirname(current_dir))]:
-                _c = os.path.join(_parent, "core")
-                exists = "✅ found" if os.path.isdir(_c) else "❌ not found"
-                st.markdown(f"- `{_c}` → {exists}")
-
-    if not MODULES_OK:
-        st.error(
-            "🚫 **앱을 시작할 수 없습니다.** 위 오류를 해결한 뒤 다시 실행해 주세요.\n\n"
-            "일반적인 원인:\n"
-            "- `core/` 폴더가 `app.py` 와 같은 디렉토리에 없음\n"
-            "- 필요한 패키지가 설치되지 않음 (`pip install -r requirements.txt`)\n"
-            "- `__init__.py` 파일 누락"
-        )
-        st.stop()
+    from core.inverse_design import run_inverse_design, build_error_map
+    from core.model_processor import process_uploaded_model
+    from core.parting_line_analyzer import analyze_parting_line
+    from core.slide_core_optimizer import optimize_mold_design
+    from core.flow_csv_generator import generate_flow_csv_from_github
+    try:
+        from core.ml_feedback import train_or_update_model, apply_ml_correction
+        ML_AVAILABLE = True
+    except ImportError:
+        ML_AVAILABLE = False
+    try:
+        from core.drawing_sync import load_drawing_features_from_csv, generate_cad_macro_script
+    except ImportError:
+        pass
+    MODULES_OK = True
+except ImportError as e:
+    st.error(f"⚠️ Module load failed: {e}")
+    st.stop()
 
 # ── CSS ──────────────────────────────────────────────────
 st.markdown("""
@@ -564,8 +425,8 @@ elif current_stage == "stage0":
 
     with col_a:
         st.markdown(f"#### {T['input_geometry']}")
-        t_min = st.number_input(T["min_thick"], 0.3, 10.0,
-                        value=max(0.3, float(derived["min_thickness"])) if derived else 1.8, step=0.1)
+        t_min  = st.number_input(T["min_thick"],   0.5, 10.0,
+                                 value=float(derived["min_thickness"]) if derived else 1.8, step=0.1)
         t_max  = st.number_input(T["max_thick"],   0.5, 20.0,
                                  value=float(derived["max_thickness"]) if derived else 3.2, step=0.1)
         flow_l = st.number_input(T["flow_length"], 10.0, 500.0,
@@ -670,83 +531,134 @@ elif current_stage == "stage1":
     with tab_import:
         st.markdown("#### 📂 Load Flow Analysis Results")
 
-        # ── Option A: GitHub Signal ID로 자동 CSV 생성 ─────────────
+        # ── Option A: GitHub Signal ID ──────────────────────────────
         with st.expander("🔗 Option A — Load from MIM-Ops Simulation (GitHub)", expanded=True):
             st.markdown("""
-            <div class="link-card">
-            <strong>Step 1:</strong> Run simulation at 
-            <a href="https://openfoam-injection-automation.streamlit.app/" target="_blank">
-            🚀 MIM-Ops Pro</a><br>
-            <strong>Step 2:</strong> Enter your Signal ID below to load results automatically.
-            </div>
-            """, unsafe_allow_html=True)
+            **Step 1:** Run simulation at
+            [🚀 MIM-Ops Pro](https://openfoam-injection-automation.streamlit.app/)
+            → 시뮬레이션 완료 후 돌아오세요.
 
+            **Step 2:** Signal ID를 아래에 입력하고 **Generate CSV** 클릭.
+            """)
+
+            with st.expander("❓ Signal ID는 어디서 확인하나요?", expanded=False):
+                st.markdown("""
+                GitHub `OpenFOAM-Injection-Automation` 저장소 → **Actions** 탭
+                → 완료된 워크플로 클릭 → Artifacts 섹션에서 이름 확인:
+                ```
+                simulation-47664275
+                ```
+                아래 형식 **모두 동작**합니다:
+
+                | 입력 형식 | 예시 |
+                |---|---|
+                | 숫자 ID만 | `47664275` |
+                | 전체 아티팩트 이름 | `simulation-47664275` |
+                | 가장 최근 결과 자동 선택 | `latest` |
+                """)
+
+            # ── 진단 버튼 ──────────────────────────────────────────
+            if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
+                try:
+                    from core.flow_csv_generator import list_artifacts
+                    with st.spinner("GitHub에서 목록 가져오는 중..."):
+                        artifacts = list_artifacts(per_page=20)
+                    if artifacts:
+                        st.success(f"✅ {len(artifacts)}개 아티팩트 발견 — 아래 이름(또는 숫자부분)을 Signal ID에 입력하세요")
+                        st.dataframe([{
+                            "아티팩트 이름": a["name"],
+                            "생성일":        a["created_at"][:10],
+                            "크기(MB)":      f"{a.get('size_in_bytes',0)/1024/1024:.1f}",
+                        } for a in artifacts], use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("⚠️ 아티팩트가 없습니다. MIM-Ops에서 시뮬레이션을 먼저 실행하세요.")
+                except Exception as e:
+                    st.error(str(e))
+                    if "GITHUB_TOKEN" in str(e):
+                        st.code('''# Streamlit Cloud Secrets에 추가:
+GITHUB_TOKEN          = "ghp_xxxxxxxxxxxx"
+OPENFOAM_REPO_OWNER   = "workshopcompany"
+OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
+                    elif "404" in str(e):
+                        st.warning("저장소 이름을 확인하세요. Secrets의 OPENFOAM_REPO_NAME이 정확한지 확인하세요.")
+
+            st.divider()
+
+            # ── Signal ID 입력 & CSV 생성 ──────────────────────────
             sig_col1, sig_col2 = st.columns([3, 1])
             with sig_col1:
                 signal_id = st.text_input(
                     "Signal ID (from MIM-Ops simulation)",
                     value=st.session_state.get("github_sim_signal_id", ""),
-                    placeholder="e.g. e2d394fe",
-                    help="Found in simulation results folder name: simulation-{signal_id}"
+                    placeholder="예: 47664275  또는  simulation-47664275  또는  latest",
+                    help="숫자 ID, 전체 아티팩트 이름, 또는 'latest' 입력 가능",
                 )
             with sig_col2:
                 st.write("")
                 st.write("")
-                if st.button("📥 Generate CSV", use_container_width=True, type="primary"):
-                    if signal_id.strip():
-                        with st.spinner("Fetching from GitHub..."):
-                            try:
-                                cae_df = generate_flow_csv_from_github(signal_id.strip())
-                                st.session_state["cae_df"] = cae_df
-                                st.session_state["github_sim_signal_id"] = signal_id.strip()
-                                st.session_state["flow_csv_ready"] = True
-                                st.success(f"✅ Flow data loaded from simulation-{signal_id.strip()}")
-                            except Exception as e:
-                                st.error(f"❌ {e}")
-                    else:
-                        st.warning("Please enter a Signal ID.")
+                gen_btn = st.button("📥 Generate CSV", use_container_width=True, type="primary")
+
+            if gen_btn:
+                if not signal_id.strip():
+                    st.warning("Signal ID를 입력하세요. 모르면 위 '아티팩트 목록 확인' 버튼을 먼저 누르세요.")
+                else:
+                    with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
+                        try:
+                            cae_df = generate_flow_csv_from_github(signal_id.strip())
+                            st.session_state["cae_df"] = cae_df
+                            st.session_state["github_sim_signal_id"] = signal_id.strip()
+                            st.session_state["flow_csv_ready"] = True
+                            st.success(
+                                f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
+                                f"재료: {cae_df['material'].iloc[0]} | "
+                                f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
+                            )
+                        except FileNotFoundError as e:
+                            st.error(str(e))
+                        except Exception as e:
+                            st.error(f"❌ 오류: {e}")
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
+                st.markdown("**데이터 미리보기 (상위 5행)**")
                 st.dataframe(df_preview.head(5), use_container_width=True)
+                col_s1, col_s2, col_s3 = st.columns(3)
+                col_s1.metric("총 포인트", f"{len(df_preview):,}")
+                col_s2.metric("최대 압력", f"{df_preview['pressure'].max():.1f} MPa")
+                col_s3.metric("충진 시간", f"{df_preview['fill_time'].max():.3f} s")
                 csv_bytes = df_preview.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("💾 Download CSV", csv_bytes, "flow_analysis.csv", "text/csv",
+                st.download_button("💾 CSV 다운로드", csv_bytes, "flow_analysis.csv", "text/csv",
                                    use_container_width=True)
 
-        # ── Option B: 수동 CSV 업로드 ──────────────────────────────
+        # ── Option B: 수동 CSV 업로드 ────────────────────────────────
         with st.expander("📄 Option B — Manual CSV Upload"):
-            st.markdown(f"""
-            <div class="info-box">
-            <strong>{T['required_cols']}</strong><br>
-            <span class="mono">x, y, pressure(MPa), temperature(°C), fill_time(s)</span><br>
-            OpenFOAM → postProcess → CSV export / Moldflow export
-            </div>
-            """, unsafe_allow_html=True)
-            uploaded = st.file_uploader(T.get("select_cae_file", "Select CAE CSV File"), type=["csv"])
+            st.markdown("""
+            **필수 컬럼:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
+            `z` 컬럼은 선택 (있으면 3D 시각화)
+            """)
+            uploaded = st.file_uploader(T.get("select_cae_file", "CAE CSV 파일 선택"), type=["csv"])
             use_sample = st.checkbox(T["use_sample"], value=False)
 
         use_ml = st.toggle(T["apply_ml"], value=False)
+        st.divider()
 
         if st.button(T["btn_st1"], type="primary", use_container_width=True):
-            with st.spinner(T.get("st1_analyzing", "Analyzing...")):
+            with st.spinner(T.get("st1_analyzing", "분석 중...")):
                 try:
-                    # 데이터 소스 우선순위: GitHub > 수동 업로드 > 샘플
                     cae_df = st.session_state.get("cae_df")
                     if cae_df is None:
                         if uploaded and not use_sample:
                             cae_df = load_cae_data(uploaded)
                         else:
                             cae_df = generate_sample_cae_csv(n_points=300, material=material)
-                            st.info(f"📌 {T.get('msg_using_sample', 'Using sample data.')}")
-
-                    if use_ml:
-                        st.toast(T["toast_ml_analyzing"], icon="🤖")
+                            st.info(f"📌 {T.get('msg_using_sample', '샘플 데이터로 분석합니다.')}")
 
                     analysis = analyze_cae(cae_df, material=material)
-                    st.session_state["cae_df"]      = cae_df
-                    st.session_state["cae_analysis"] = analysis
-                    st.session_state["stage1_done"]  = True
+                    st.session_state["cae_df"]       = cae_df
+                    st.session_state["cae_analysis"]  = analysis
+                    st.session_state["stage1_done"]   = True
                     st.success(T["msg_analysis_done"])
+                    st.rerun()
                 except Exception as e:
                     st.error(f"{T['msg_error']}: {e}")
 
