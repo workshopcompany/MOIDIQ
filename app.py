@@ -702,69 +702,74 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
             colorscales = {"pressure": "Blues", "temperature": "Hot", "fill_time": "Viridis"}
             fields = list(field_options.keys())
 
-            # ── 게이트 위치: fill_time 최솟값 포인트 = 절대좌표 앵커 ──
+            # ── 게이트 위치 절대좌표 앵커링 ─────────────────────────
+            # fill_time이 가장 작은 점 = 게이트 (금속이 처음 도달한 지점)
             has_z_global = "z" in cae_df.columns
-            gate_idx = cae_df["fill_time"].idxmin()
-            gate_row = cae_df.loc[gate_idx]
+            gate_row = cae_df.loc[cae_df["fill_time"].idxmin()]
             gate_x = float(gate_row["x"])
             gate_y = float(gate_row["y"])
             gate_z = float(gate_row["z"]) if has_z_global else 0.0
 
-            # ── Bounding Box & 상대좌표 ───────────────────────────────
+            # ── 상대좌표 계산 (Bounding Box 정규화) ──────────────────
             x_min, x_max = cae_df["x"].min(), cae_df["x"].max()
             y_min, y_max = cae_df["y"].min(), cae_df["y"].max()
-            z_min, z_max = (cae_df["z"].min(), cae_df["z"].max()) if has_z_global else (0.0, 1.0)
+            z_min, z_max = (cae_df["z"].min(), cae_df["z"].max()) if has_z_global else (0, 1)
+            x_range = x_max - x_min if x_max != x_min else 1
+            y_range = y_max - y_min if y_max != y_min else 1
+            z_range = z_max - z_min if z_max != z_min else 1
 
-            # 게이트로부터 거리 → 상대화
+            # 게이트로부터의 거리 (유동 선단 추적용)
             if has_z_global:
-                cae_df = cae_df.copy()
                 cae_df["dist_from_gate"] = np.sqrt(
                     (cae_df["x"] - gate_x)**2 +
                     (cae_df["y"] - gate_y)**2 +
                     (cae_df["z"] - gate_z)**2
                 )
             else:
-                cae_df = cae_df.copy()
                 cae_df["dist_from_gate"] = np.sqrt(
-                    (cae_df["x"] - gate_x)**2 +
-                    (cae_df["y"] - gate_y)**2
+                    (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2
                 )
-            max_dist = float(cae_df["dist_from_gate"].max()) or 1.0
-            cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist
+            max_dist = cae_df["dist_from_gate"].max()
+            cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist  # 0=게이트, 1=유동선단
 
-            # ── scipy 보간 (전체 탭 공통으로 한 번만) ────────────────
-            from scipy.interpolate import griddata as _gd
-            _pts = cae_df[["x", "y", "z"]].values if has_z_global else cae_df[["x", "y"]].values
+            # ── 공통 scene / layout 설정 ─────────────────────────────
+            _scene_cfg = dict(
+                xaxis_title="X (mm)", yaxis_title="Y (mm)",
+                zaxis_title="Z (mm)" if has_z_global else "",
+                bgcolor="#111318",
+                xaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                           gridcolor="#252b36", showbackground=True),
+                yaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                           gridcolor="#252b36", showbackground=True),
+                zaxis=dict(color="#e2e8f0", backgroundcolor="#111318",
+                           gridcolor="#252b36", showbackground=True),
+                aspectmode="data",
+            )
+            _layout_cfg = dict(
+                paper_bgcolor="#0a0c0f", font_color="#e2e8f0",
+                height=520, margin=dict(l=0, r=0, t=45, b=0),
+                legend=dict(bgcolor="rgba(17,19,24,0.85)",
+                            bordercolor="#252b36",
+                            font=dict(color="#e2e8f0")),
+            )
 
-            if has_z_global:
-                _n = 22  # 격자 해상도 (높일수록 정밀, 느려짐)
-                _xi = np.linspace(x_min, x_max, _n)
-                _yi = np.linspace(y_min, y_max, _n)
-                _zi = np.linspace(z_min, z_max, _n)
-                _xi3, _yi3, _zi3 = np.meshgrid(_xi, _yi, _zi, indexing="ij")
-                _grid_pts = (_xi3, _yi3, _zi3)
-                _grid_shape = (_n, _n, _n)
-                _grids = {}
-                for _ft in fields:
-                    if _ft in cae_df.columns:
-                        _v = _gd(_pts, cae_df[_ft].values, _grid_pts, method="linear")
-                        _vn = _gd(_pts, cae_df[_ft].values, _grid_pts, method="nearest")
-                        _v[np.isnan(_v)] = _vn[np.isnan(_v)]
-                        _grids[_ft] = _v
-            else:
-                _n2 = 60
-                _xi2 = np.linspace(x_min, x_max, _n2)
-                _yi2 = np.linspace(y_min, y_max, _n2)
-                _xi2g, _yi2g = np.meshgrid(_xi2, _yi2)
-                _grids2d = {}
-                for _ft in fields:
-                    if _ft in cae_df.columns:
-                        _v = _gd(cae_df[["x","y"]].values, cae_df[_ft].values,
-                                 (_xi2g, _yi2g), method="linear")
-                        _vn = _gd(cae_df[["x","y"]].values, cae_df[_ft].values,
-                                  (_xi2g, _yi2g), method="nearest")
-                        _v[np.isnan(_v)] = _vn[np.isnan(_v)]
-                        _grids2d[_ft] = _v
+            # 게이트 마커 (공통)
+            def _gate_trace_3d(zv):
+                return go.Scatter3d(
+                    x=[gate_x], y=[gate_y], z=[zv],
+                    mode="markers+text",
+                    marker=dict(size=12, color="#ff2222", symbol="diamond",
+                                line=dict(width=2, color="white")),
+                    text=["GATE"], textposition="top center",
+                    textfont=dict(color="#ff6666", size=11),
+                    name=f"🔴 Gate ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f})",
+                    showlegend=True,
+                )
+
+            front_df = cae_df[cae_df["rel_dist"] > 0.85]
+            z_col    = cae_df["z"] if has_z_global else pd.Series([0.0]*len(cae_df),
+                                                                    index=cae_df.index)
+            z_gate   = gate_z if has_z_global else 0.0
 
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
@@ -773,159 +778,100 @@ OPENFOAM_REPO_NAME    = "OpenFOAM-Injection-Automation"''', language="toml")
                         st.info(f"No '{ft}' column in data.")
                         continue
 
-                    if has_z_global:
-                        # ── 3D: Volume + Isosurface + Gate 마커만 ─────
-                        _vi = _grids.get(ft)
-                        if _vi is None:
-                            st.info(f"보간 실패: {ft}")
-                            continue
-                        _vmin = float(np.nanmin(_vi))
-                        _vmax = float(np.nanmax(_vi))
+                    # ── 필드별 시각화 파라미터 ─────────────────────────
+                    if ft == "pressure":
+                        # 게이트 가까울수록 큰 점
+                        dist_norm    = cae_df["rel_dist"]
+                        pt_size_arr  = (4 + 8 * (1 - dist_norm)).clip(4, 12).tolist()
+                        pt_color     = cae_df["pressure"]
+                        cscale       = "Blues"
+                        pt_opacity   = 0.85          # ← 반드시 단일 float
+                        cb_title     = "Pressure (MPa)"
+                        extra_trace  = None
 
-                        fig3d = go.Figure()
+                    elif ft == "temperature":
+                        pt_size_arr  = 7
+                        pt_color     = cae_df["temperature"]
+                        cscale       = "Hot"
+                        pt_opacity   = 0.85          # ← 반드시 단일 float
+                        cb_title     = "Temp (°C)"
+                        extra_trace  = None
 
-                        # [1] Volume: 반투명 전체 충진 볼륨
-                        fig3d.add_trace(go.Volume(
-                            x=_xi3.flatten(),
-                            y=_yi3.flatten(),
-                            z=_zi3.flatten(),
-                            value=_vi.flatten(),
-                            isomin=_vmin,
-                            isomax=_vmax,
-                            opacity=0.10,
-                            surface_count=20,
-                            colorscale=colorscales[ft],
-                            showscale=False,
-                            caps=dict(x_show=False, y_show=False, z_show=False),
-                            name="Volume",
-                            showlegend=False,
-                        ))
+                    else:  # fill_time
+                        pt_size_arr  = 7
+                        pt_color     = cae_df["fill_time"]
+                        cscale       = "Viridis"
+                        pt_opacity   = 0.85
+                        cb_title     = "Fill Time (s)"
+                        # 유동 선단 오버레이
+                        extra_trace  = go.Scatter3d(
+                            x=front_df["x"], y=front_df["y"],
+                            z=front_df["z"] if has_z_global else [0.0]*len(front_df),
+                            mode="markers",
+                            marker=dict(size=9, color="#00ffcc", opacity=1.0,
+                                        symbol="circle",
+                                        line=dict(color="#ffffff", width=1)),
+                            name="🟢 Flow Front (>85%)",
+                            showlegend=True,
+                        ) if len(front_df) > 0 else None
 
-                        # [2] Isosurface: 물성 등가면 (Moldflow 스타일)
-                        _iso_lo = _vmin + (_vmax - _vmin) * 0.20
-                        _iso_hi = _vmax - (_vmax - _vmin) * 0.03
-                        fig3d.add_trace(go.Isosurface(
-                            x=_xi3.flatten(),
-                            y=_yi3.flatten(),
-                            z=_zi3.flatten(),
-                            value=_vi.flatten(),
-                            isomin=_iso_lo,
-                            isomax=_iso_hi,
-                            surface_count=6,
-                            colorscale=colorscales[ft],
-                            opacity=0.60,
-                            caps=dict(x_show=False, y_show=False, z_show=False),
+                    # ── 메인 포인트 클라우드 ────────────────────────────
+                    fig3d = go.Figure()
+                    fig3d.add_trace(go.Scatter3d(
+                        x=cae_df["x"],
+                        y=cae_df["y"],
+                        z=z_col,
+                        mode="markers",
+                        marker=dict(
+                            size=pt_size_arr,
+                            color=pt_color,
+                            colorscale=cscale,
                             colorbar=dict(
-                                title=dict(text=field_options[ft],
+                                title=dict(text=cb_title,
                                            font=dict(color="#e2e8f0")),
                                 tickfont=dict(color="#e2e8f0"),
-                                thickness=15,
+                                x=1.02,
                             ),
-                            name=field_options[ft],
-                            showlegend=False,
-                        ))
+                            opacity=pt_opacity,   # 단일 float — 배열 불가
+                            line=dict(width=0),
+                        ),
+                        customdata=np.stack([
+                            cae_df[ft].values,
+                            cae_df["rel_dist"].values,
+                            cae_df["fill_time"].values,
+                        ], axis=-1),
+                        hovertemplate=(
+                            f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
+                            "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
+                            "Gate Dist: %{customdata[1]:.0%}<br>"
+                            "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
+                        ),
+                        name=f"{field_options[ft]} Field",
+                        showlegend=True,
+                    ))
 
-                        # [3] Gate 마커 — Scatter3d, opacity는 trace 레벨로
-                        fig3d.add_trace(go.Scatter3d(
-                            x=[gate_x], y=[gate_y], z=[gate_z],
-                            mode="markers+text",
-                            marker=dict(
-                                size=12,
-                                color="#ff2222",
-                                symbol="diamond",
-                                line=dict(width=2, color="white"),
-                            ),
-                            opacity=1.0,          # ← marker 밖 trace 레벨
-                            text=["GATE"],
-                            textposition="top center",
-                            textfont=dict(color="#ff6666", size=12, family="Space Mono"),
-                            name="Gate",
-                            showlegend=True,
-                        ))
+                    if extra_trace is not None:
+                        fig3d.add_trace(extra_trace)
 
-                        # [4] 유동 선단 (rel_dist > 0.85) — 작은 마커, no opacity in marker
-                        _front = cae_df[cae_df["rel_dist"] > 0.85]
-                        if len(_front) > 0:
-                            fig3d.add_trace(go.Scatter3d(
-                                x=_front["x"].values,
-                                y=_front["y"].values,
-                                z=_front["z"].values,
-                                mode="markers",
-                                marker=dict(
-                                    size=3,
-                                    color="#00ffcc",
-                                    symbol="circle",
-                                ),
-                                opacity=0.65,     # ← trace 레벨
-                                name="Flow Front",
-                                showlegend=True,
-                            ))
+                    # ── 게이트 앵커 ─────────────────────────────────────
+                    fig3d.add_trace(_gate_trace_3d(z_gate))
 
-                        fig3d.update_layout(
-                            scene=dict(
-                                xaxis_title=f"X  Gate={gate_x:.2f}mm",
-                                yaxis_title=f"Y  Gate={gate_y:.2f}mm",
-                                zaxis_title=f"Z  Gate={gate_z:.2f}mm",
-                                bgcolor="#0d0f14",
-                                xaxis=dict(color="#c0c8d8", backgroundcolor="#111318",
-                                           gridcolor="#1e2530", showbackground=True),
-                                yaxis=dict(color="#c0c8d8", backgroundcolor="#111318",
-                                           gridcolor="#1e2530", showbackground=True),
-                                zaxis=dict(color="#c0c8d8", backgroundcolor="#111318",
-                                           gridcolor="#1e2530", showbackground=True),
-                                aspectmode="data",
-                            ),
-                            paper_bgcolor="#0a0c0f",
-                            font_color="#e2e8f0",
-                            height=520,
-                            margin=dict(l=0, r=0, t=45, b=0),
-                            title=dict(
-                                text=(f"<b>{field_options[ft]} Distribution</b>"
-                                      f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"),
-                                font=dict(color="#e2e8f0", size=13),
-                            ),
-                            legend=dict(
-                                bgcolor="rgba(13,15,20,0.85)",
-                                bordercolor="#2a3040",
-                                font=dict(color="#c0c8d8", size=11),
-                                x=0.01, y=0.99,
-                            ),
-                        )
-                        st.plotly_chart(fig3d, use_container_width=True)
+                    fig3d.update_layout(
+                        **_layout_cfg,
+                        scene=_scene_cfg,
+                        title=dict(
+                            text=(f"{field_options[ft]} Distribution  "
+                                  f"| Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"),
+                            font=dict(color="#e2e8f0", size=13),
+                        ),
+                    )
+                    st.plotly_chart(fig3d, use_container_width=True)
 
-                        # ── 지표 행 ───────────────────────────────────
-                        _c1, _c2, _c3 = st.columns(3)
-                        _c1.metric("🎯 Gate (절대좌표)",
+                    col_gi1, col_gi2, col_gi3 = st.columns(3)
+                    col_gi1.metric("🎯 Gate 절대위치",
                                    f"({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm")
-                        _c2.metric("📏 최대 유동 거리", f"{max_dist:.2f} mm")
-                        _c3.metric("🌊 유동 선단 포인트", f"{len(_front)}개")
-
-                    else:
-                        # ── 2D fallback: 보간 heatmap ─────────────────
-                        _v2 = _grids2d.get(ft)
-                        if _v2 is None:
-                            st.info(f"보간 실패: {ft}")
-                            continue
-                        fig2d = go.Figure()
-                        fig2d.add_trace(go.Heatmap(
-                            z=_v2, x=_xi2, y=_yi2,
-                            colorscale=colorscales[ft],
-                            colorbar=dict(title=field_options[ft]),
-                        ))
-                        fig2d.add_trace(go.Scatter(
-                            x=[gate_x], y=[gate_y],
-                            mode="markers+text",
-                            marker=dict(size=14, color="red", symbol="diamond"),
-                            text=["Gate"], textposition="top right",
-                            textfont=dict(color="white"),
-                        ))
-                        fig2d.update_layout(
-                            paper_bgcolor="#0a0c0f", plot_bgcolor="#111318",
-                            font_color="#e2e8f0", height=420,
-                            xaxis_title="X (mm)", yaxis_title="Y (mm)",
-                            margin=dict(l=20, r=20, t=30, b=20),
-                        )
-                        st.plotly_chart(fig2d, use_container_width=True)
+                    col_gi2.metric("📏 최대 유동 거리", f"{max_dist:.2f} mm")
+                    col_gi3.metric("🌊 유동 선단 포인트", f"{len(front_df)}개")
 
             # 통계 지표
             c1, c2, c3, c4 = st.columns(4)
