@@ -564,8 +564,8 @@ elif current_stage == "stage0":
 
     with col_a:
         st.markdown(f"#### {T['input_geometry']}")
-        t_min  = st.number_input(T["min_thick"],   0.5, 10.0,
-                                 value=float(derived["min_thickness"]) if derived else 1.8, step=0.1)
+        t_min = st.number_input(T["min_thick"], 0.5, 10.0,
+                        value=max(0.5, float(derived["min_thickness"])) if derived else 1.8, step=0.1)
         t_max  = st.number_input(T["max_thick"],   0.5, 20.0,
                                  value=float(derived["max_thickness"]) if derived else 3.2, step=0.1)
         flow_l = st.number_input(T["flow_length"], 10.0, 500.0,
