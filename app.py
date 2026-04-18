@@ -505,12 +505,8 @@ init_state()
 #  사이드바
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
-    # 언어 설정
-    st.markdown("### 🌐 Language Settings")
-    lang = st.selectbox("Select Language",
-        ["English", "한국어", "Español", "日本語", "中文", "Français", "हिन्दी"],
-        index=0, key="lang_select")
-    T = TRANSLATIONS.get(lang, TRANSLATIONS["English"])
+    # Language fixed to English
+    T = TRANSLATIONS.get("English", TRANSLATIONS["English"])
 
     st.markdown("## 🔩 MOLDIQ")
     st.markdown(f'<div class="mono" style="color:#55667a;font-size:0.65rem;">{T["platform_desc"]}</div>',
@@ -562,8 +558,8 @@ with st.sidebar:
         else:
             st.warning(T.get("warn_run_st2_first", "Please run Stage 2 first."))
 
-# ── 언어 객체 (사이드바 밖에서도 사용) ───────────────────
-T = TRANSLATIONS.get(st.session_state.get("lang_select", "English"), TRANSLATIONS["English"])
+# Language fixed to English globally
+T = TRANSLATIONS.get("English", TRANSLATIONS["English"])
 
 # ══════════════════════════════════════════════════════════
 #  공통 유틸
@@ -595,28 +591,28 @@ def _check_github_secrets() -> bool:
 
 def _show_github_token_guide():
     """GitHub Token 미설정 시 단계별 안내 UI 표시."""
-    st.error("🔑 **GITHUB_TOKEN이 설정되지 않았습니다.**")
-    with st.expander("📋 설정 방법 — 클릭해서 펼치기", expanded=True):
+    st.error("🔑 **GITHUB_TOKEN is not configured.**")
+    with st.expander("📋 Setup Instructions — Click to expand", expanded=True):
         st.markdown("""
-**Streamlit Cloud를 사용하는 경우:**
-1. [share.streamlit.io](https://share.streamlit.io) → 앱 → ⋯ 메뉴 → **Edit secrets**
-2. 아래 내용을 붙여넣고 토큰값만 교체:
+**For Streamlit Cloud:**
+1. [share.streamlit.io](https://share.streamlit.io) → App → ⋯ menu → **Edit secrets**
+2. Paste the following and replace the token value:
 
 ```toml
-GITHUB_TOKEN        = "ghp_YOUR_TOKEN_HERE"
-OPENFOAM_REPO_OWNER = "workshopcompany"
-OPENFOAM_REPO_NAME  = "OpenFOAM-Injection-Automation"
+GITHUB_TOKEN           = "ghp_YOUR_TOKEN_HERE"
+OPENFOAM_REPO_OWNER    = "workshopcompany"
+OPENFOAM_REPO_NAME     = "OpenFOAM-Injection-Automation"
 ```
 
-**로컬 실행의 경우:**
-프로젝트 루트 `.streamlit/secrets.toml` 파일을 위 내용으로 생성.
+**For local execution:**
+Create `.streamlit/secrets.toml` in your project root with the content above.
 
-**GitHub Token 발급:**
+**Generate a GitHub Token:**
 GitHub → Settings → Developer settings → Personal access tokens → Generate new token (classic)
-→ `repo` 권한 체크 → 생성된 토큰 복사
+→ Check `repo` scope → Copy the generated token
 
 ---
-💡 **GitHub 없이 바로 사용:** 아래 **Option C** (VTK 파일 직접 업로드)로 결과를 로드하세요.
+💡 **Use without GitHub:** Load results via **Option C** (direct VTK file upload) below.
         """)
 
 
@@ -967,98 +963,87 @@ elif current_stage == "stage1":
             st.markdown("""
             **Step 1:** Run simulation at
             [🚀 MIM-Ops Pro](https://openfoam-injection-automation.streamlit.app/)
-            → 시뮬레이션 완료 후 돌아오세요.
+            → Return here after simulation completes.
 
-            **Step 2:** Signal ID를 아래에 입력하고 **Generate CSV** 클릭.
+            **Step 2:** Enter Signal ID below and click **Generate CSV**.
             """)
 
-            with st.expander("❓ Signal ID는 어디서 확인하나요?", expanded=False):
+            with st.expander("❓ Where do I find my Signal ID?", expanded=False):
                 st.markdown("""
-                GitHub `OpenFOAM-Injection-Automation` 저장소 → **Actions** 탭
-                → 완료된 워크플로 클릭 → Artifacts 섹션에서 이름 확인:
+                GitHub `OpenFOAM-Injection-Automation` repo → **Actions** tab
+                → Click completed workflow → Check artifact name in Artifacts section:
                 ```
                 simulation-47664275
                 ```
-                아래 형식 **모두 동작**합니다:
+                All of the following formats **work**:
 
-                | 입력 형식 | 예시 |
+                | Input Format | Example |
                 |---|---|
-                | 숫자 ID만 | `47664275` |
-                | 전체 아티팩트 이름 | `simulation-47664275` |
-                | 가장 최근 결과 자동 선택 | `latest` |
+                | Numeric ID only | `47664275` |
+                | Full artifact name | `simulation-47664275` |
+                | Auto-select latest | `latest` |
                 """)
 
             # ── 진단 버튼 ──────────────────────────────────────────
-            if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
+            if st.button("🔍 Check Artifact List", help="Fetch artifact list from GitHub to verify Signal IDs"):
 
                 def _fetch_artifacts_direct(per_page: int = 50) -> list:
-                    """GitHub API로 artifacts 목록 직접 조회."""
+                    """Fetch artifact list directly via GitHub API."""
                     try:
-                        # 1. 토큰 및 설정 로드
                         token = st.secrets["GITHUB_TOKEN"]
-                        
-                        # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
-                        # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
-                        owner = st.secrets.get("REPO_OWNER") or "workshopcompany"
-                        repo  = st.secrets.get("REPO_NAME") or "openfoam-injection-automation"
-                        
+                        owner = (st.secrets.get("OPENFOAM_REPO_OWNER")
+                                 or st.secrets.get("REPO_OWNER")
+                                 or "workshopcompany")
+                        repo  = (st.secrets.get("OPENFOAM_REPO_NAME")
+                                 or st.secrets.get("REPO_NAME")
+                                 or "OpenFOAM-Injection-Automation")
                     except (KeyError, FileNotFoundError):
-                        raise RuntimeError("GITHUB_TOKEN이 .streamlit/secrets.toml에 없습니다.")
+                        raise RuntimeError("GITHUB_TOKEN not found in .streamlit/secrets.toml")
 
-                    # 2. GitHub API 호출 (최신순 조회를 위해 per_page 상향)
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
                     headers = {
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/vnd.github+json",
                         "X-GitHub-Api-Version": "2022-11-28"
                     }
-                    
                     try:
-                        # 최신 아티팩트를 먼저 확인하기 위해 쿼리 매개변수 확인
                         resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
-                        
                         if resp.status_code == 401:
-                            raise RuntimeError("GITHUB_TOKEN이 유효하지 않거나 권한이 없습니다 (401).")
+                            raise RuntimeError("GITHUB_TOKEN is invalid or lacks permissions (401).")
                         if resp.status_code == 404:
-                            raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
-                        
+                            raise RuntimeError(f"Repository not found: {owner}/{repo} (404)")
                         resp.raise_for_status()
                         return resp.json().get("artifacts", [])
                     except requests.exceptions.RequestException as e:
-                        raise RuntimeError(f"GitHub 연결 실패: {str(e)}")
+                        raise RuntimeError(f"GitHub connection failed: {str(e)}")
 
-                # --- 버튼 클릭 시 실행 로직 ---
-                if not _check_github_secrets(): # 기존 코드에 있는 체크 함수 호출
+                if not _check_github_secrets():
                     _show_github_token_guide()
                 else:
                     try:
-                        with st.spinner("GitHub에서 시뮬레이션 결과 목록을 가져오는 중..."):
+                        with st.spinner("Fetching simulation result list from GitHub..."):
                             artifacts = _fetch_artifacts_direct(per_page=30)
-                        
+
                         if artifacts:
-                            st.success(f"✅ {len(artifacts)}개의 시뮬레이션 결과 발견")
-                            st.info("아래 목록의 '아티팩트 이름'에서 'simulation-' 뒤의 문구(예: cf22322a)를 Signal ID에 입력하세요.")
-                            
-                            # 사용자에게 보여줄 데이터 프레임 구성
+                            st.success(f"✅ Found {len(artifacts)} simulation result(s)")
+                            st.info("From the list below, copy the part after 'simulation-' (e.g. cf22322a) as your Signal ID.")
                             display_data = []
                             for a in artifacts:
-                                # 'simulation-'으로 시작하는 파일만 필터링하거나 강조할 수 있습니다.
                                 display_data.append({
-                                    "아티팩트 이름": a["name"],
-                                    "생성일": a["created_at"].replace("T", " ").replace("Z", ""),
-                                    "크기(MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
-                                    "상태": "사용 가능" if not a.get("expired") else "만료됨"
+                                    "Artifact Name": a["name"],
+                                    "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
+                                    "Size (MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
+                                    "Status": "Available" if not a.get("expired") else "Expired"
                                 })
-                            
                             st.dataframe(display_data, use_container_width=True, hide_index=True)
                         else:
-                            st.warning("⚠️ 아티팩트가 없습니다. GitHub Actions에서 시뮬레이션이 완료되었는지 확인하세요.")
-                            
+                            st.warning("⚠️ No artifacts found. Check that your GitHub Actions simulation has completed.")
+
                     except RuntimeError as e:
                         st.error(str(e))
                         _show_github_token_guide()
                     except Exception as e:
-                        st.error(f"❌ 예상치 못한 오류: {e}")
+                        st.error(f"❌ Unexpected error: {e}")
 
             st.divider()
 
@@ -1068,8 +1053,8 @@ elif current_stage == "stage1":
                 signal_id = st.text_input(
                     "Signal ID (from MIM-Ops simulation)",
                     value=st.session_state.get("github_sim_signal_id", ""),
-                    placeholder="예: 47664275  또는  simulation-47664275  또는  latest",
-                    help="숫자 ID, 전체 아티팩트 이름, 또는 'latest' 입력 가능",
+                    placeholder="e.g. 47664275  or  simulation-47664275  or  latest",
+                    help="Numeric ID, full artifact name, or 'latest'",
                 )
             with sig_col2:
                 st.write("")
@@ -1078,22 +1063,22 @@ elif current_stage == "stage1":
 
             if gen_btn:
                 if not signal_id.strip():
-                    st.warning("Signal ID를 입력하세요. 모르면 위 '아티팩트 목록 확인' 버튼을 먼저 누르세요.")
+                    st.warning("Please enter a Signal ID. Use the 'Check Artifact List' button above if unsure.")
                 else:
                     _github_ok = _check_github_secrets()
                     if not _github_ok:
                         _show_github_token_guide()
                     else:
-                        with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
+                        with st.spinner(f"Loading results for '{signal_id.strip()}'..."):
                             try:
                                 cae_df = generate_flow_csv_from_github(signal_id.strip())
                                 st.session_state["cae_df"] = cae_df
                                 st.session_state["github_sim_signal_id"] = signal_id.strip()
                                 st.session_state["flow_csv_ready"] = True
                                 st.success(
-                                    f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
-                                    f"재료: {cae_df['material'].iloc[0]} | "
-                                    f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
+                                    f"✅ Loaded! {len(cae_df):,} points | "
+                                    f"Material: {cae_df['material'].iloc[0]} | "
+                                    f"Max Pressure: {cae_df['pressure'].max():.1f} MPa"
                                 )
                             except FileNotFoundError as e:
                                 st.error(str(e))
@@ -1105,21 +1090,21 @@ elif current_stage == "stage1":
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
-                st.markdown("**데이터 미리보기 (상위 5행)**")
+                st.markdown("**Data Preview (top 5 rows)**")
                 st.dataframe(df_preview.head(5), use_container_width=True)
                 col_s1, col_s2, col_s3 = st.columns(3)
-                col_s1.metric("총 포인트", f"{len(df_preview):,}")
-                col_s2.metric("최대 압력", f"{df_preview['pressure'].max():.1f} MPa")
-                col_s3.metric("충진 시간", f"{df_preview['fill_time'].max():.3f} s")
+                col_s1.metric("Total Points", f"{len(df_preview):,}")
+                col_s2.metric("Max Pressure", f"{df_preview['pressure'].max():.1f} MPa")
+                col_s3.metric("Fill Time", f"{df_preview['fill_time'].max():.3f} s")
                 csv_bytes = df_preview.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("💾 CSV 다운로드", csv_bytes, "flow_analysis.csv", "text/csv",
+                st.download_button("💾 Download CSV", csv_bytes, "flow_analysis.csv", "text/csv",
                                    use_container_width=True)
 
         # ── Option B: 수동 CSV 업로드 ────────────────────────────────
         with st.expander("📄 Option B — Manual CSV Upload"):
             st.markdown("""
-            **필수 컬럼:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
-            `z` 컬럼은 선택 (있으면 3D 시각화)
+            **Required columns:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
+            `z` column is optional (enables 3D visualization)
             """)
             uploaded = st.file_uploader(T.get("select_cae_file", "CAE CSV 파일 선택"), type=["csv"])
             use_sample = st.checkbox(T["use_sample"], value=False)
@@ -1129,35 +1114,35 @@ elif current_stage == "stage1":
                     _df_b = load_cae_data(uploaded)
                     st.session_state["cae_df"] = _df_b
                     st.session_state["flow_csv_ready"] = True
-                    st.success(f"✅ CSV 로드 완료! {len(_df_b):,}개 포인트 | 최대 압력: {_df_b['pressure'].max():.1f} MPa")
+                    st.success(f"✅ CSV loaded! {len(_df_b):,} points | Max Pressure: {_df_b['pressure'].max():.1f} MPa")
                 except Exception as _e:
                     st.error(f"CSV 파싱 오류: {_e}")
 
         # ── Option C: VTK 파일 직접 업로드 (FIX-1 + FIX-3) ─────────
-        with st.expander("🗂️ Option C — VTK/VTU 파일 직접 업로드 (OpenFOAM 결과)", expanded=False):
+        with st.expander("🗂️ Option C — Direct VTK/VTU Upload (OpenFOAM Results)", expanded=False):
             st.markdown("""
-            **OpenFOAM `foamToVTK` 결과물을 직접 업로드하세요.**
-            - **ZIP 파일** (`internal.vtu` 포함): 시뮬레이션 결과 폴더 전체를 압축한 .zip
-            - **단일 VTU 파일** (`internal.vtu`): 내부 솔리드 메쉬 데이터
+            **Upload your OpenFOAM `foamToVTK` output directly.**
+            - **ZIP file** (containing `internal.vtu`): Compress the entire simulation result folder
+            - **Single VTU file** (`internal.vtu`): Internal solid mesh data
 
-            > 📌 업로드하면 압력(p), 속도(U) 등 **실제 OpenFOAM 계산값**으로 CSV가 자동 생성됩니다.
+            > 📌 CSV is auto-generated from actual OpenFOAM computed values (pressure p, velocity U, etc.)
             """)
 
             vtk_col1, vtk_col2 = st.columns([3, 1])
             with vtk_col1:
                 vtk_upload = st.file_uploader(
-                    "VTK 결과 파일 선택",
+                    "Select VTK Result File",
                     type=["zip", "vtu", "vtm", "vtp"],
                     key="vtk_direct_uploader",
-                    help="ZIP: 폴더 전체 압축 | .vtu: internal.vtu 개별 업로드",
+                    help="ZIP: compress full folder | .vtu: upload internal.vtu directly",
                 )
             with vtk_col2:
                 st.write(""); st.write("")
-                vtk_gen_btn = st.button("🔄 VTK → CSV 변환", key="vtk_gen_btn",
+                vtk_gen_btn = st.button("🔄 Convert VTK → CSV", key="vtk_gen_btn",
                                         use_container_width=True, type="primary")
 
             if vtk_upload and vtk_gen_btn:
-                with st.spinner("VTK 파일 파싱 중..."):
+                with st.spinner("Parsing VTK file..."):
                     try:
                         raw = vtk_upload.getvalue()
                         ext = vtk_upload.name.lower().split(".")[-1]
@@ -1171,25 +1156,25 @@ elif current_stage == "stage1":
                         st.session_state["flow_csv_ready"] = True
                         st.session_state["vtk_solid_df"]  = _vtk_df  # Solid Mesh 탭용
                         st.success(
-                            f"✅ VTK 파싱 완료! **{len(_vtk_df):,}개 포인트** | "
-                            f"최대 압력: {_vtk_df['pressure'].max():.3f} MPa | "
-                            f"파일: {vtk_upload.name}"
+                            f"✅ VTK parsed! **{len(_vtk_df):,} points** | "
+                            f"Max Pressure: {_vtk_df['pressure'].max():.3f} MPa | "
+                            f"File: {vtk_upload.name}"
                         )
                         # CSV 다운로드 버튼
                         csv_vtk = _vtk_df.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
-                            "💾 생성된 CSV 다운로드",
+                            "💾 Download Generated CSV",
                             csv_vtk, "vtk_flow_results.csv", "text/csv",
                             use_container_width=True,
                         )
                     except Exception as _ve:
-                        st.error(f"❌ VTK 파싱 오류: {_ve}")
-                        st.info("💡 파일 형식을 확인하세요. ASCII 형식 .vtu만 지원합니다. (`foamToVTK -ascii`)")
+                        st.error(f"❌ VTK parse error: {_ve}")
+                        st.info("💡 Check file format. Only ASCII .vtu is supported. (`foamToVTK -ascii`)")
 
             # 이미 VTK 데이터가 로드된 경우 상태 표시
             if st.session_state.get("vtk_solid_df") is not None:
                 _vs = st.session_state["vtk_solid_df"]
-                st.info(f"🧊 Solid Mesh 데이터 로드됨: {len(_vs):,} pts — 'Solid Mesh (VTK)' 탭에서 확인하세요.")
+                st.info(f"🧊 Solid Mesh data loaded: {len(_vs):,} pts — check the 'Solid Mesh (VTK)' tab.")
 
 
 
@@ -1381,7 +1366,7 @@ elif current_stage == "stage1":
                     st.success(f"✅ {stl_mesh_data['name']}\n({stl_mesh_data['n_faces']:,} faces)")
 
             if stl_upload_field is not None:
-                with st.spinner("STL 파싱 중..."):
+                with st.spinner("Parsing STL..."):
                     try:
                         file_bytes = stl_upload_field.read()
                         verts, faces = _parse_stl_binary(file_bytes)
@@ -1648,7 +1633,7 @@ elif current_stage == "stage1":
                             ))
                             _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
                         else:
-                            st.warning("셀 메쉬 생성 실패 — 데이터를 확인하세요.")
+                            st.warning("Cell mesh generation failed — please check your data.")
                             _render_label = "Cell Mesh (error)"
 
                         # 유동선단 오버레이 (fill_time 탭)
@@ -1862,8 +1847,7 @@ elif current_stage == "stage1":
             st.markdown("#### 🧊 Solid Mesh 체적 시각화 (OpenFOAM VTK 실제 결과)")
             st.markdown("""
             <div class="info-box">
-            STL 껍데기 위에 데이터를 매핑하던 방식 대신, <b>OpenFOAM이 계산한 내부 솔리드 메쉬 데이터</b>를
-            직접 Point Cloud로 시각화합니다. 좌측 <b>Data Input → Option C</b>에서 VTK 파일을 먼저 업로드하세요.
+            Instead of mapping data onto an STL shell, this tab visualizes <b>OpenFOAM solid mesh data</b> directly as a Point Cloud. Upload a VTK file via <b>Data Input → Option C</b> first.
             </div>
             """, unsafe_allow_html=True)
 
@@ -1882,7 +1866,7 @@ elif current_stage == "stage1":
                     type=["vtu", "vtm", "zip"], key="solid_shortcut_uploader",
                 )
                 if _solid_shortcut:
-                    with st.spinner("VTK 파싱 중..."):
+                    with st.spinner("Parsing VTK..."):
                         try:
                             _raw = _solid_shortcut.getvalue()
                             _ext = _solid_shortcut.name.lower().split(".")[-1]
@@ -1920,7 +1904,7 @@ elif current_stage == "stage1":
 
                     # 통계 메트릭
                     _mc = st.columns(4)
-                    _mc[0].metric("총 포인트", f"{len(solid_df):,}")
+                    _mc[0].metric("Total Points", f"{len(solid_df):,}")
                     if "pressure" in solid_df.columns:
                         _mc[1].metric("최대 압력", f"{solid_df['pressure'].max():.3f} MPa")
                     if "U_mag" in solid_df.columns:
@@ -2010,7 +1994,7 @@ elif current_stage == "stage1":
                     st.divider()
                     _csv_solid = solid_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        "📥 Solid Mesh CSV 다운로드",
+                        "📥 Download Solid Mesh CSV",
                         _csv_solid, "solid_mesh_results.csv", "text/csv",
                         use_container_width=True,
                     )
