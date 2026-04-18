@@ -1610,7 +1610,9 @@ elif current_stage == "stage1":
 
                     # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
                     # ── 분기 1: CAE 포인트 → Voxel Grid (3D 고체) ──────────────
+                    # ── [핵심 복구] 분기 1: CAE 데이터가 존재할 때 (Voxel Grid 적용) ──
                     if _has_voxel_data:
+                        # 주소 위치와 데이터를 정확히 참조하도록 cae_df 사용
                         _MAX_PTS = 20000
                         vdf = cae_df.sample(min(len(cae_df), _MAX_PTS))
                         
@@ -1627,15 +1629,32 @@ elif current_stage == "stage1":
                         ))
                         _render_label = f"Voxel Grid ({len(vdf):,} cells)"
 
-                    # ── 분기 2: STL 메쉬만 있는 경우 ────────────────────────────
+                    # ── [핵심 복구] 분기 2: STL 메쉬 데이터만 있는 경우 (원본 유지) ──
                     elif stl_mesh_data is not None:
-                        # 여기에 기존 STL Mesh 그리는 add_trace 코드가 있다면 유지하세요.
+                        # 전전 코드(app (3).py)에 있던 원래의 Mesh3d 로직입니다.
+                        # 이 부분이 살아있어야 GitHub 주소를 통한 데이터 로딩과 연동됩니다.
+                        fig3d.add_trace(go.Mesh3d(
+                            x=stl_mesh_data['x'], y=stl_mesh_data['y'], z=stl_mesh_data['z'],
+                            i=stl_mesh_data['i'], j=stl_mesh_data['j'], k=stl_mesh_data['k'],
+                            color='lightgray', opacity=0.3, name="Base STL"
+                        ))
                         _render_label = "STL Mesh Model"
 
-                    # ── 분기 3: 데이터 없음 ─────────────────────────────────────
+                    # ── [핵심 복구] 분기 3: 데이터가 아예 없는 경우 ──
                     else:
-                        st.warning("표시할 3D 데이터가 없습니다.")
+                        st.warning("데이터 주소를 찾을 수 없거나 표시할 3D 데이터가 없습니다.")
                         _render_label = "No Data"
+
+                    # ── 유동선단 오버레이 (fill_time 전용) ──
+                    if ft == "fill_time" and 'front_df' in locals() and len(front_df) > 0:
+                        fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                        fig3d.add_trace(go.Scatter3d(
+                            x=front_df["x"], y=front_df["y"], z=fz,
+                            mode="markers",
+                            marker=dict(size=4, color="#00ffcc", opacity=0.9,
+                                        line=dict(color="#ffffff", width=0.5)),
+                            name="🟢 Flow Front (>85%)", showlegend=True,
+                        ))
 
                     # ── [중요] 유동선단 오버레이: else 밖으로 꺼내야 모든 상황에서 보입니다 ──
                     if ft == "fill_time" and len(front_df) > 0:
