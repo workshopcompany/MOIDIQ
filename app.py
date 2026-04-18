@@ -7,7 +7,7 @@ Stage Flow:
 """
 
 import streamlit as st
-import os, sys, json, re, io, zipfile, struct, base64
+import os, sys, json, re, io, zipfile, struct, base64, zlib
 import xml.etree.ElementTree as ET
 import pandas as pd
 import numpy as np
