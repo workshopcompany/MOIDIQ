@@ -4,6 +4,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.interpolate import griddata # 상단에 추가 필요
 
 # ── 재료별 공정 기준 ──────────────────────────────────────
+PROCESS_LIMITS: dict = {}
 PROCESS_LIMITS.update({
     "CATAMOLD-304L": {
         "melt_temp": (175, 200),
@@ -660,7 +661,7 @@ def _build_grid_maps(df: pd.DataFrame) -> dict:
             grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
             
             # 3. 보간 후 끝부분의 NaN 값을 가장 가까운 값으로 채움
-            grid_z = pd.DataFrame(grid_z).fillna(method='ffill').fillna(method='bfill').values
+            grid_z = pd.DataFrame(grid_z).ffill().bfill().values
             
             # 4. 시각화를 위해 다시 부드럽게 스무딩
             grid_z = gaussian_filter(grid_z.astype(float), sigma=1.0)
