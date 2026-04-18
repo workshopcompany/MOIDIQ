@@ -1581,15 +1581,19 @@ elif current_stage == "stage1":
                         dl_col1, dl_col2 = st.columns(2)
                         with dl_col1:
                             alphahull_val = st.slider(
-                                "alphahull 정밀도", 1, 20, 5, 1,
+                                "Mesh 정밀도 (AlphaHull)", 
+                                min_value=-1, 
+                                max_value=10, 
+                                value=-1,  # 기본값을 -1(가장 빠름)로 설정해서 앱 멈춤 방지
+                                step=1,
                                 key=f"alphahull_{ft}",
-                                help="값이 작을수록 데이터 밀도에 맞춰 정밀하게 메쉬 생성. -1은 Convex Hull(볼록 껍질)",
+                                help="-1: 전체를 감싸는 껍질(가장 빠름), 0: 자동, 숫자가 작을수록(1, 2...) 데이터 윤곽에 더 밀착하지만 계산이 매우 무거워집니다."
                             )
                         with dl_col2:
                             dl_opacity = st.slider(
                                 "투명도", 0.3, 1.0, 1.0, 0.05,
                                 key=f"dl_opacity_{ft}",
-                                help="1.0 = 완전 불투명 Solid | 0.5~0.7 = 내부 투시",
+                                help="0.8 = 완전 불투명 Solid | 0.5~0.7 = 내부 투시",
                             )
 
                         # 포인트 수 제한 (25,000 — 데이터 손실 최소화)
