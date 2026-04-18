@@ -1597,7 +1597,7 @@ elif current_stage == "stage1":
                             )
 
                         # 포인트 수 제한 (25,000 — 데이터 손실 최소화)
-                        _dl_n = min(len(cae_df), 5000) # 25000에서 5000으로 하향
+                        _dl_n = min(len(cae_df), 2000) # 25000에서 2000으로 하향
                         vdf = cae_df.sample(_dl_n, random_state=42) if len(cae_df) > _dl_n else cae_df.copy()
                         _dl_z = vdf["z"].values if has_z_global else np.zeros(len(vdf))
 
