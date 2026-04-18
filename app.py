@@ -1259,7 +1259,8 @@ elif current_stage == "stage1":
 
         def _map_cae_to_mesh(vertices, cae_df, field, gate_pos):
             """각 mesh vertex에 CAE 포인트의 field 값을 XY 기반 IDW로 매핑.
-            판형 파트는 Z 정규화가 거리를 왜곡하므로 XY 평면만 사용."""
+            판형 파트는 Z 정규화가 거리를 왜곡하므로 XY 평면만 사용.
+            [FIX] k=8 → k=min(20, n) 으로 증가 + IDW power=3 으로 높여 날카로운 경계 감소"""
             cae_xy  = cae_df[["x", "y"]].values.astype(float)
             cae_vals = cae_df[field].values.astype(float)
 
@@ -1274,7 +1275,9 @@ elif current_stage == "stage1":
             vn = (verts_xy - v_min) / v_range
             cn = (cae_xy   - c_min) / c_range
 
-            k = min(8, len(cn))
+            # [FIX] k 를 최대 20개로 늘려 보간 경계 부드럽게
+            k = min(20, len(cn))
+            idw_power = 2  # 제곱 역거리 (너무 높으면 뾰족해짐)
             intensity = np.empty(len(vn))
             for vi in range(len(vn)):
                 dists = np.linalg.norm(cn - vn[vi], axis=1)
@@ -1283,7 +1286,7 @@ elif current_stage == "stage1":
                 if d_k.min() < 1e-9:
                     intensity[vi] = cae_vals[idx_k[d_k.argmin()]]
                 else:
-                    w = 1.0 / (d_k ** 2)
+                    w = 1.0 / (d_k ** idw_power + 1e-12)
                     intensity[vi] = np.dot(w, cae_vals[idx_k]) / w.sum()
             return intensity
 
@@ -1470,7 +1473,7 @@ elif current_stage == "stage1":
 
                     else:
                         # ── STL 없음: Cell Mesh (CAE 포인트 기반) ───────────
-                        def _build_cell_mesh(df_in, field_col, max_pts=8000):
+                        def _build_cell_mesh(df_in, field_col, max_pts=40000):
                             _df = df_in.copy()
                             if len(_df) == 0:
                                 return None
@@ -1480,16 +1483,21 @@ elif current_stage == "stage1":
                             v_arr = _df[field_col].values.astype(float)
                             z_range  = float(z_arr.max() - z_arr.min())
                             xy_range = max(float(x_arr.max()-x_arr.min()), float(y_arr.max()-y_arr.min()), 1e-6)
+                            # [FIX] z_half 를 xy_range * 0.04 → 0.012 로 축소
+                            # 기존 값은 얇은 파트(예: 60mm 판)의 z를 ±2.4mm 인위 팽창 → 셀이 두꺼운 슬랩처럼 보임
+                            # 0.012 는 60mm 판 기준 ±0.72mm → 형상에 더 밀착
                             if z_range < xy_range * 0.05:
-                                z_mid = float(z_arr.mean()); z_half = xy_range * 0.04
+                                z_mid = float(z_arr.mean())
+                                z_half = max(z_range * 0.5, xy_range * 0.012)  # 실제 두께 우선, 최소 1.2%
                                 z_arr = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
                             x_span = float(x_arr.max()-x_arr.min()) or 1.0
                             y_span = float(y_arr.max()-y_arr.min()) or 1.0
                             z_span = float(z_arr.max()-z_arr.min()) or 1.0
                             vol_cbrt = max_pts**(1/3); scale = (x_span*y_span*z_span)**(1/3) or 1.0
-                            nx=min(max(4,int(vol_cbrt*x_span/scale)),60)
-                            ny=min(max(4,int(vol_cbrt*y_span/scale)),60)
-                            nz=min(max(2,int(vol_cbrt*z_span/scale)),20)
+                            # [FIX] nx/ny 상한 60 → 150, nz 20 → 50 으로 상향 → 셀 크기 대폭 감소
+                            nx=min(max(8,int(vol_cbrt*x_span/scale)),150)
+                            ny=min(max(8,int(vol_cbrt*y_span/scale)),150)
+                            nz=min(max(4,int(vol_cbrt*z_span/scale)),50)
                             x_bins=np.linspace(x_arr.min(),x_arr.max(),nx+1)
                             y_bins=np.linspace(y_arr.min(),y_arr.max(),ny+1)
                             z_bins=np.linspace(z_arr.min(),z_arr.max(),nz+1)
@@ -1586,8 +1594,11 @@ elif current_stage == "stage1":
                         title=dict(
                             text=(
                                 f"{field_options[ft]} Distribution"
-                                f"{'  [Mesh3d — STL Surface]' if stl_mesh_data else '  [Point Cloud]'}"
-                                f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
+                                + (
+                                    "  [Mesh3d — STL Surface]" if stl_mesh_data
+                                    else "  [Cell Mesh — CAE Grid]"
+                                )
+                                + f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
                             ),
                             font=dict(color="#e2e8f0", size=13),
                         ),
