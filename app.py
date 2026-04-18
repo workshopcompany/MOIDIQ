@@ -1525,13 +1525,11 @@ elif current_stage == "stage1":
                     vox_val[fm] = s_sum[fm] / s_cnt[fm]
 
                 # ── Voxel 면(face) → Mesh3d 삼각형 생성 ──────────────────
-                # 각 채워진 voxel의 6면 중 "외부 노출면"만 추출
-                # (이웃 voxel이 비어있거나 경계인 면)
-                # 성능을 위해 모든 면 포함 (중복 감수)
-                tri_vx, tri_vy, tri_vz = [], [], []   # vertex coords
-                face_val_list = []
+                # 구조: quad 1개 = 4 vertex + 2 triangle (tri1: 0,1,2 / tri2: 0,2,3)
+                # 각 quad는 독립된 4 vertex를 가짐 (인덱스 충돌 없음)
+                # intensitymode="cell" → triangle 수 = len(i) = n_quads * 2
+                # intensity 배열 길이도 반드시 n_quads * 2 이어야 함
 
-                # 8 코너의 로컬 오프셋 (unit cube)
                 cx = (x_bins[:-1] + x_bins[1:]) / 2
                 cy = (y_bins[:-1] + y_bins[1:]) / 2
                 cz = (z_bins[:-1] + z_bins[1:]) / 2
@@ -1539,73 +1537,66 @@ elif current_stage == "stage1":
                 dy2 = (y_bins[1] - y_bins[0]) / 2
                 dz2 = (z_bins[1] - z_bins[0]) / 2
 
-                # 6면의 4코너 오프셋 정의 (±dx2, ±dy2, ±dz2)
-                # 각 면은 quad → 2 tri
+                # 6면 정의 (quad 코너 4개 오프셋)
                 face_defs = [
-                    # (normal_axis, offsets for 4 corners)
-                    # +X face
-                    [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],
-                    # -X face
-                    [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],
-                    # +Y face
-                    [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],
-                    # -Y face
-                    [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],
-                    # +Z face
-                    [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],
-                    # -Z face
-                    [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],
+                    [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],  # +X
+                    [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],  # -X
+                    [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],  # +Y
+                    [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],  # -Y
+                    [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],  # +Z
+                    [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],  # -Z
                 ]
-
-                # 이웃 voxel 오프셋 (6방향)
-                neighbor_offsets = [
-                    (1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)
-                ]
+                neighbor_offsets = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
 
                 active = np.argwhere(~np.isnan(vox_val))
 
+                # 결과 누적 리스트
+                all_vx, all_vy, all_vz = [], [], []
+                tri_ii, tri_jj, tri_kk = [], [], []
+                tri_vals = []   # triangle당 하나의 값 (intensitymode="cell")
+                n_quads_added = 0
+
                 for (ii, jj, kk) in active:
-                    v_center = vox_val[ii, jj, kk]
-                    ox, oy, oz = cx[ii], cy[jj], cz[kk]
+                    v_center = float(vox_val[ii, jj, kk])
+                    ox, oy, oz = float(cx[ii]), float(cy[jj]), float(cz[kk])
 
                     for face_idx, corners in enumerate(face_defs):
-                        # 이웃이 채워져 있으면 내부면 → 스킵 (외부 노출면만)
-                        ni, nj, nk = (ii + neighbor_offsets[face_idx][0],
-                                      jj + neighbor_offsets[face_idx][1],
-                                      kk + neighbor_offsets[face_idx][2])
+                        ni = ii + neighbor_offsets[face_idx][0]
+                        nj = jj + neighbor_offsets[face_idx][1]
+                        nk = kk + neighbor_offsets[face_idx][2]
+                        # 내부면(이웃이 채워진 면) 스킵
                         if (0 <= ni < nx and 0 <= nj < ny and 0 <= nk < nz
                                 and not np.isnan(vox_val[ni, nj, nk])):
-                            continue   # 내부면 — 스킵
+                            continue
 
-                        # quad → 2 triangles
-                        p0 = (ox+corners[0][0], oy+corners[0][1], oz+corners[0][2])
-                        p1 = (ox+corners[1][0], oy+corners[1][1], oz+corners[1][2])
-                        p2 = (ox+corners[2][0], oy+corners[2][1], oz+corners[2][2])
-                        p3 = (ox+corners[3][0], oy+corners[3][1], oz+corners[3][2])
+                        # 4 vertex 추가 (quad당 독립 4개)
+                        base = n_quads_added * 4
+                        for cx_, cy_, cz_ in corners:
+                            all_vx.append(ox + cx_)
+                            all_vy.append(oy + cy_)
+                            all_vz.append(oz + cz_)
 
-                        base = len(tri_vx)
-                        tri_vx.extend([p0[0],p1[0],p2[0],p3[0]])
-                        tri_vy.extend([p0[1],p1[1],p2[1],p3[1]])
-                        tri_vz.extend([p0[2],p1[2],p2[2],p3[2]])
-                        # tri1: 0,1,2  tri2: 0,2,3
-                        face_val_list.extend([v_center, v_center])
+                        # tri1: base+0, base+1, base+2
+                        tri_ii.append(base);     tri_jj.append(base+1); tri_kk.append(base+2)
+                        tri_vals.append(v_center)
+                        # tri2: base+0, base+2, base+3
+                        tri_ii.append(base);     tri_jj.append(base+2); tri_kk.append(base+3)
+                        tri_vals.append(v_center)
 
-                if not face_val_list:
+                        n_quads_added += 1
+
+                if n_quads_added == 0:
                     return None
 
-                # vertex 수 = n_faces * 4, face 인덱스 = 연속 4개씩
-                n_faces = len(face_val_list)
-                idx_base = np.arange(n_faces) * 4
-                tri_i = np.concatenate([idx_base, idx_base])
-                tri_j = np.concatenate([idx_base + 1, idx_base + 2])
-                tri_k = np.concatenate([idx_base + 2, idx_base + 3])
-                face_colors = np.array(face_val_list * 2)
-
                 return {
-                    "x": np.array(tri_vx), "y": np.array(tri_vy), "z": np.array(tri_vz),
-                    "i": tri_i, "j": tri_j, "k": tri_k,
-                    "facecolor": face_colors,
-                    "n_cells": n_faces,
+                    "x": np.array(all_vx, dtype=np.float32),
+                    "y": np.array(all_vy, dtype=np.float32),
+                    "z": np.array(all_vz, dtype=np.float32),
+                    "i": np.array(tri_ii, dtype=np.int32),
+                    "j": np.array(tri_jj, dtype=np.int32),
+                    "k": np.array(tri_kk, dtype=np.int32),
+                    "facecolor": np.array(tri_vals, dtype=np.float32),
+                    "n_cells": n_quads_added,
                 }
 
             for i, ftab in enumerate(field_tabs):
