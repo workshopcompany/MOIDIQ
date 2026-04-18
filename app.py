@@ -1609,45 +1609,44 @@ elif current_stage == "stage1":
                     fig3d = go.Figure()
 
                     # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
+                    # ── 분기 1: CAE 포인트 → Voxel Grid (3D 고체) ──────────────
                     if _has_voxel_data:
-                        # 1. 데이터 샘플링 (들여쓰기: 2단 탭 / 20칸 추천)
                         _MAX_PTS = 20000
                         vdf = cae_df.sample(min(len(cae_df), _MAX_PTS))
                         
-                        # 2. Voxel(격자) 시각화
                         fig3d.add_trace(go.Scatter3d(
                             x=vdf["x"], y=vdf["y"], z=vdf["z"],
                             mode='markers',
                             marker=dict(
-                                size=6,
-                                symbol='square',
-                                color=vdf[ft],
-                                colorscale=colorscales[ft],
-                                opacity=1.0,
-                                showscale=False
+                                size=6, symbol='square',
+                                color=vdf[ft], colorscale=colorscales[ft],
+                                opacity=1.0, showscale=False
                             ),
-                            name=f"{field_options[ft]} (Voxel Grid)",
-                            hovertemplate=(
-                                f"<b>{field_options[ft]}: %{{marker.color:.2f}}</b><br>"
-                                "X: %{x:.2f} | Y: %{y:.2f} | Z: %{z:.2f}<extra></extra>"
-                            )
+                            name=f"{field_options[ft]} (Voxel)",
+                            hovertemplate=f"<b>{field_options[ft]}: %{{marker.color:.2f}}</b><br>X:%{{x:.2f}} Y:%{{y:.2f}} Z:%{{z:.2f}}<extra></extra>"
                         ))
                         _render_label = f"Voxel Grid ({len(vdf):,} cells)"
 
-                    else:  # 이 else가 위 if _has_voxel_data와 정확히 세로 줄이 맞아야 합니다.
-                        st.warning("표시할 Voxel 데이터가 없습니다.")
-                        _render_label = "No Voxel Data"
+                    # ── 분기 2: STL 메쉬만 있는 경우 ────────────────────────────
+                    elif stl_mesh_data is not None:
+                        # 여기에 기존 STL Mesh 그리는 add_trace 코드가 있다면 유지하세요.
+                        _render_label = "STL Mesh Model"
 
-                        # 유동선단 오버레이 (fill_time 탭)
-                        if ft == "fill_time" and len(front_df) > 0:
-                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
-                            fig3d.add_trace(go.Scatter3d(
-                                x=front_df["x"], y=front_df["y"], z=fz,
-                                mode="markers",
-                                marker=dict(size=4, color="#00ffcc", opacity=0.9,
-                                            line=dict(color="#ffffff", width=0.5)),
-                                name="🟢 Flow Front (>85%)", showlegend=True,
-                            ))
+                    # ── 분기 3: 데이터 없음 ─────────────────────────────────────
+                    else:
+                        st.warning("표시할 3D 데이터가 없습니다.")
+                        _render_label = "No Data"
+
+                    # ── [중요] 유동선단 오버레이: else 밖으로 꺼내야 모든 상황에서 보입니다 ──
+                    if ft == "fill_time" and len(front_df) > 0:
+                        fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                        fig3d.add_trace(go.Scatter3d(
+                            x=front_df["x"], y=front_df["y"], z=fz,
+                            mode="markers",
+                            marker=dict(size=4, color="#00ffcc", opacity=0.9,
+                                        line=dict(color="#ffffff", width=0.5)),
+                            name="🟢 Flow Front (>85%)", showlegend=True,
+                        ))
 
                     # ══ 분기 2: STL 있으면 Mesh3d ════════════════════════════
                     elif stl_mesh_data is not None:
