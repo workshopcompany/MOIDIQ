@@ -1564,60 +1564,59 @@ elif current_stage == "stage1":
                     # ── 렌더링 모드 선택 ────────────────────────────────
                     render_mode = st.radio(
                         "🎨 렌더링 모드",
-                        ["🔬 Isosurface (Solid — 권장)", "🟦 Cell Mesh (Voxel)"],
+                        ["🧱 Delaunay Solid (권장)", "🟦 Cell Mesh (Voxel)"],
                         horizontal=True,
                         key=f"render_mode_{ft}",
-                        help="Isosurface: 등치면 기반 매끄러운 솔리드 렌더링 | Cell Mesh: 복셀 격자 렌더링",
+                        help="Delaunay Solid: 모든 압력/온도 데이터를 꽉 찬 덩어리로 렌더링 | Cell Mesh: 복셀 격자 방식",
                     )
-                    use_isosurface = render_mode.startswith("🔬")
+                    use_delaunay = render_mode.startswith("🧱")
 
-                    if use_isosurface:
+                    if use_delaunay:
                         # ════════════════════════════════════════════════
-                        #  Isosurface 렌더링
-                        #  · 해석 데이터(x,y,z,value)로 직접 등치면 계산
-                        #  · STL 불필요 — 데이터 자체가 형상을 만든다
+                        #  Delaunay alphahull 기반 Solid Field 렌더링
+                        #  · intensity=field_value → 압력/온도 전체 보존
+                        #  · alphahull: 점군 → 정밀 삼각 메쉬 자동 생성
+                        #  · STL 불필요 — 해석 데이터가 직접 형상을 만든다
                         # ════════════════════════════════════════════════
-                        iso_col1, iso_col2 = st.columns(2)
-                        with iso_col1:
-                            surface_count = st.slider(
-                                "등치면 레이어 수", 3, 15, 7, 1,
-                                key=f"iso_surfaces_{ft}",
-                                help="층 수가 많을수록 디테일하지만 느려집니다",
+                        dl_col1, dl_col2 = st.columns(2)
+                        with dl_col1:
+                            alphahull_val = st.slider(
+                                "alphahull 정밀도", 1, 20, 5, 1,
+                                key=f"alphahull_{ft}",
+                                help="값이 작을수록 데이터 밀도에 맞춰 정밀하게 메쉬 생성. -1은 Convex Hull(볼록 껍질)",
                             )
-                        with iso_col2:
-                            iso_opacity = st.slider(
+                        with dl_col2:
+                            dl_opacity = st.slider(
                                 "투명도", 0.3, 1.0, 1.0, 0.05,
-                                key=f"iso_opacity_{ft}",
-                                help="1.0 = 완전 불투명 Solid | 0.6 = 내부 투시 가능",
+                                key=f"dl_opacity_{ft}",
+                                help="1.0 = 완전 불투명 Solid | 0.5~0.7 = 내부 투시",
                             )
 
-                        # 포인트 수 제한 (브라우저 성능 보호: 최대 20,000)
-                        _iso_n = min(len(cae_df), 20000)
-                        vdf = cae_df.sample(_iso_n, random_state=42) if len(cae_df) > _iso_n else cae_df.copy()
-                        _iso_z = vdf["z"].values if has_z_global else np.zeros(len(vdf))
+                        # 포인트 수 제한 (25,000 — 데이터 손실 최소화)
+                        _dl_n = min(len(cae_df), 25000)
+                        vdf = cae_df.sample(_dl_n, random_state=42) if len(cae_df) > _dl_n else cae_df.copy()
+                        _dl_z = vdf["z"].values if has_z_global else np.zeros(len(vdf))
 
-                        with st.spinner(f"🔄 Isosurface 계산 중 ({_iso_n:,}pts × {surface_count} layers)..."):
-                            fig3d.add_trace(go.Isosurface(
+                        with st.spinner(f"🔄 Delaunay Solid 메쉬 생성 중 ({_dl_n:,}pts)..."):
+                            fig3d.add_trace(go.Mesh3d(
                                 x=vdf["x"].values,
                                 y=vdf["y"].values,
-                                z=_iso_z,
-                                value=vdf[ft].values,
-                                isomin=float(vdf[ft].min()),
-                                isomax=float(vdf[ft].max()),
-                                surface_count=surface_count,
-                                opacity=iso_opacity,
-                                caps=dict(x_show=True, y_show=True, z_show=True),
+                                z=_dl_z,
+                                intensity=vdf[ft].values,   # 압력/온도 데이터 전 정점에 매핑
+                                intensitymode="vertex",
                                 colorscale=colorscales[ft],
                                 colorbar=dict(
                                     title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                     tickfont=dict(color="#e2e8f0"), x=1.02,
                                 ),
-                                flatshading=True,
-                                lighting=dict(ambient=0.8, diffuse=0.6, specular=0.2, roughness=0.5),
-                                name=f"{field_options[ft]} (Isosurface · {surface_count} layers)",
+                                opacity=dl_opacity,
+                                alphahull=alphahull_val,    # 점군 → 삼각 메쉬 자동 생성 핵심 파라미터
+                                flatshading=True,           # 해석 격자 면 분할 느낌 강조
+                                lighting=dict(ambient=0.85, diffuse=0.5, specular=0.1, roughness=0.8),
+                                name=f"{field_options[ft]} (Delaunay Solid)",
                                 showlegend=True,
                                 hovertemplate=(
-                                    f"<b>{field_options[ft]}: %{{value:.2f}}</b><br>"
+                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
                                     "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
                                 ),
                             ))
@@ -1630,17 +1629,15 @@ elif current_stage == "stage1":
                                 x=_sv[:, 0], y=_sv[:, 1], z=_sv[:, 2],
                                 i=_sf[:, 0], j=_sf[:, 1], k=_sf[:, 2],
                                 color="#88aacc", opacity=0.08,
-                                flatshading=True,
-                                name="STL Outline (ref)",
+                                flatshading=True, name="STL Outline (ref)",
                                 showlegend=True, hoverinfo="skip",
                             ))
 
                         st.caption(
-                            f"🔬 Isosurface: **{_iso_n:,}pts** × **{surface_count} layers** | "
-                            f"투명도 {iso_opacity:.2f}"
+                            f"🧱 Delaunay Solid: **{_dl_n:,}pts** | alphahull={alphahull_val} | 투명도 {dl_opacity:.2f}"
                             + (" | +STL 윤곽선" if stl_mesh_data else "")
                         )
-                        _title_mode = f"Isosurface · {surface_count}L"
+                        _title_mode = f"Delaunay Solid (αhull={alphahull_val})"
 
                     else:
                         # ════════════════════════════════════════════════
