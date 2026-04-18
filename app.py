@@ -991,14 +991,21 @@ elif current_stage == "stage1":
                     """Fetch artifact list directly via GitHub API."""
                     try:
                         token = st.secrets["GITHUB_TOKEN"]
-                        owner = (st.secrets.get("OPENFOAM_REPO_OWNER")
-                                 or st.secrets.get("REPO_OWNER")
-                                 or "workshopcompany")
-                        repo  = (st.secrets.get("OPENFOAM_REPO_NAME")
-                                 or st.secrets.get("REPO_NAME")
-                                 or "OpenFOAM-Injection-Automation")
-                    except (KeyError, FileNotFoundError):
-                        raise RuntimeError("GITHUB_TOKEN not found in .streamlit/secrets.toml")
+                    except (KeyError, FileNotFoundError, Exception):
+                        raise RuntimeError(
+                            "GITHUB_TOKEN not found in secrets. "
+                            "Go to your app → ⋯ → Edit secrets and add it."
+                        )
+
+                    if not token or str(token).strip() in ("", "ghp_YOUR_TOKEN_HERE", "ghp_xxxxxxxxxxxx"):
+                        raise RuntimeError("GITHUB_TOKEN is set but appears to be a placeholder. Please replace it with your actual token.")
+
+                    owner = (st.secrets.get("OPENFOAM_REPO_OWNER")
+                             or st.secrets.get("REPO_OWNER")
+                             or "workshopcompany")
+                    repo  = (st.secrets.get("OPENFOAM_REPO_NAME")
+                             or st.secrets.get("REPO_NAME")
+                             or "OpenFOAM-Injection-Automation")
 
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
                     headers = {
@@ -1007,43 +1014,40 @@ elif current_stage == "stage1":
                         "X-GitHub-Api-Version": "2022-11-28"
                     }
                     try:
-                        resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
+                        resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=15)
                         if resp.status_code == 401:
-                            raise RuntimeError("GITHUB_TOKEN is invalid or lacks permissions (401).")
+                            raise RuntimeError(f"Token rejected (401). Check that GITHUB_TOKEN is valid and has 'repo' scope. Repo: {owner}/{repo}")
                         if resp.status_code == 404:
-                            raise RuntimeError(f"Repository not found: {owner}/{repo} (404)")
+                            raise RuntimeError(f"Repository not found: {owner}/{repo} (404). Check OPENFOAM_REPO_OWNER and OPENFOAM_REPO_NAME in secrets.")
                         resp.raise_for_status()
                         return resp.json().get("artifacts", [])
                     except requests.exceptions.RequestException as e:
                         raise RuntimeError(f"GitHub connection failed: {str(e)}")
 
-                if not _check_github_secrets():
-                    _show_github_token_guide()
-                else:
-                    try:
-                        with st.spinner("Fetching simulation result list from GitHub..."):
-                            artifacts = _fetch_artifacts_direct(per_page=30)
+                # ── 바로 시도 — pre-check 없이 직접 fetch ──
+                try:
+                    with st.spinner("Fetching simulation result list from GitHub..."):
+                        artifacts = _fetch_artifacts_direct(per_page=30)
 
-                        if artifacts:
-                            st.success(f"✅ Found {len(artifacts)} simulation result(s)")
-                            st.info("From the list below, copy the part after 'simulation-' (e.g. cf22322a) as your Signal ID.")
-                            display_data = []
-                            for a in artifacts:
-                                display_data.append({
-                                    "Artifact Name": a["name"],
-                                    "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
-                                    "Size (MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
-                                    "Status": "Available" if not a.get("expired") else "Expired"
-                                })
-                            st.dataframe(display_data, use_container_width=True, hide_index=True)
-                        else:
-                            st.warning("⚠️ No artifacts found. Check that your GitHub Actions simulation has completed.")
+                    if artifacts:
+                        st.success(f"✅ Found {len(artifacts)} simulation result(s)")
+                        st.info("Copy the part after 'simulation-' (e.g. cf22322a) from the Artifact Name column below and use it as your Signal ID.")
+                        display_data = []
+                        for a in artifacts:
+                            display_data.append({
+                                "Artifact Name": a["name"],
+                                "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
+                                "Size (MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
+                                "Status": "Available" if not a.get("expired") else "Expired"
+                            })
+                        st.dataframe(display_data, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("⚠️ No artifacts found. Check that your GitHub Actions simulation has completed.")
 
-                    except RuntimeError as e:
-                        st.error(str(e))
-                        _show_github_token_guide()
-                    except Exception as e:
-                        st.error(f"❌ Unexpected error: {e}")
+                except RuntimeError as e:
+                    st.error(f"❌ {e}")
+                except Exception as e:
+                    st.error(f"❌ Unexpected error: {e}")
 
             st.divider()
 
@@ -1065,28 +1069,22 @@ elif current_stage == "stage1":
                 if not signal_id.strip():
                     st.warning("Please enter a Signal ID. Use the 'Check Artifact List' button above if unsure.")
                 else:
-                    _github_ok = _check_github_secrets()
-                    if not _github_ok:
-                        _show_github_token_guide()
-                    else:
-                        with st.spinner(f"Loading results for '{signal_id.strip()}'..."):
-                            try:
-                                cae_df = generate_flow_csv_from_github(signal_id.strip())
-                                st.session_state["cae_df"] = cae_df
-                                st.session_state["github_sim_signal_id"] = signal_id.strip()
-                                st.session_state["flow_csv_ready"] = True
-                                st.success(
-                                    f"✅ Loaded! {len(cae_df):,} points | "
-                                    f"Material: {cae_df['material'].iloc[0]} | "
-                                    f"Max Pressure: {cae_df['pressure'].max():.1f} MPa"
-                                )
-                            except FileNotFoundError as e:
-                                st.error(str(e))
-                            except Exception as e:
-                                _emsg = str(e)
-                                st.error(f"❌ 오류: {_emsg}")
-                                if "GITHUB_TOKEN" in _emsg or "token" in _emsg.lower():
-                                    _show_github_token_guide()
+                    with st.spinner(f"Loading results for '{signal_id.strip()}'..."):
+                        try:
+                            cae_df = generate_flow_csv_from_github(signal_id.strip())
+                            st.session_state["cae_df"] = cae_df
+                            st.session_state["github_sim_signal_id"] = signal_id.strip()
+                            st.session_state["flow_csv_ready"] = True
+                            st.success(
+                                f"✅ Loaded! {len(cae_df):,} points | "
+                                f"Material: {cae_df['material'].iloc[0]} | "
+                                f"Max Pressure: {cae_df['pressure'].max():.1f} MPa"
+                            )
+                        except FileNotFoundError as e:
+                            st.error(str(e))
+                        except Exception as e:
+                            _emsg = str(e)
+                            st.error(f"❌ Error: {_emsg}")
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
