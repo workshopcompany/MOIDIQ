@@ -1258,42 +1258,26 @@ elif current_stage == "stage1":
             return verts_unique, faces
 
         def _map_cae_to_mesh(vertices, cae_df, field, gate_pos):
-            """각 mesh vertex에 가장 가까운 CAE 포인트의 field 값을 거리 역가중 평균으로 매핑."""
-            cae_xyz = cae_df[["x", "y", "z"]].values if "z" in cae_df.columns \
-                      else np.column_stack([cae_df["x"].values, cae_df["y"].values,
-                                            np.zeros(len(cae_df))])
+            """각 mesh vertex에 CAE 포인트의 field 값을 XY 기반 IDW로 매핑.
+            판형 파트는 Z 정규화가 거리를 왜곡하므로 XY 평면만 사용."""
+            cae_xy  = cae_df[["x", "y"]].values.astype(float)
             cae_vals = cae_df[field].values.astype(float)
 
-            # 좌표계 스케일 맞추기 — bounding box 기반 정규화
-            v_min = vertices.min(axis=0)
-            v_max = vertices.max(axis=0)
-            c_min = cae_xyz.min(axis=0)
-            c_max = cae_xyz.max(axis=0)
+            # STL vertex XY
+            verts_xy = vertices[:, :2]
+
+            # XY bounding box 정규화
+            v_min = verts_xy.min(axis=0);  v_max = verts_xy.max(axis=0)
+            c_min = cae_xy.min(axis=0);    c_max = cae_xy.max(axis=0)
             v_range = np.where((v_max - v_min) > 0, v_max - v_min, 1.0)
             c_range = np.where((c_max - c_min) > 0, c_max - c_min, 1.0)
-            verts_norm = (vertices - v_min) / v_range
-            cae_norm   = (cae_xyz  - c_min) / c_range
+            vn = (verts_xy - v_min) / v_range
+            cn = (cae_xy   - c_min) / c_range
 
-            # 각 vertex에 대해 k=5 근접 포인트 IDW 보간
-            k = min(5, len(cae_norm))
-            intensity = np.zeros(len(verts_norm))
-            for vi in range(0, len(verts_norm), max(1, len(verts_norm)//500)):
-                diffs = cae_norm - verts_norm[vi]
-                dists = np.linalg.norm(diffs, axis=1)
-                idx_k = np.argpartition(dists, k)[:k]
-                d_k   = dists[idx_k]
-                if d_k.min() < 1e-9:
-                    intensity[vi] = cae_vals[idx_k[d_k.argmin()]]
-                else:
-                    w = 1.0 / (d_k ** 2)
-                    intensity[vi] = np.dot(w, cae_vals[idx_k]) / w.sum()
-
-            # 벡터화 구간은 위 루프로 처리했으므로 남은 vertex 처리
-            for vi in range(0, len(verts_norm)):
-                if intensity[vi] != 0:
-                    continue
-                diffs = cae_norm - verts_norm[vi]
-                dists = np.linalg.norm(diffs, axis=1)
+            k = min(8, len(cn))
+            intensity = np.empty(len(vn))
+            for vi in range(len(vn)):
+                dists = np.linalg.norm(cn - vn[vi], axis=1)
                 idx_k = np.argpartition(dists, k)[:k]
                 d_k   = dists[idx_k]
                 if d_k.min() < 1e-9:
@@ -1437,139 +1421,161 @@ elif current_stage == "stage1":
 
                     fig3d = go.Figure()
 
-                    # ── Cell Mesh 빌더 (CAE 포인트 → 3D Voxel Grid) ─────────
-                    def _build_cell_mesh(df_in, field_col, max_pts=8000):
-                        _df = df_in.copy()
-                        if len(_df) == 0:
-                            return None
-                        x_arr = _df["x"].values.astype(float)
-                        y_arr = _df["y"].values.astype(float)
-                        z_arr = _df["z"].values.astype(float) if "z" in _df.columns else np.zeros(len(_df))
-                        v_arr = _df[field_col].values.astype(float)
+                    # ── 렌더링: STL 있으면 STL Mesh3d, 없으면 Cell Mesh ────
+                    if stl_mesh_data is not None:
+                        verts = stl_mesh_data["vertices"]
+                        faces = stl_mesh_data["faces"]
 
-                        # 납작한 형상이면 두께 보정
-                        z_range  = float(z_arr.max() - z_arr.min())
-                        xy_range = max(float(x_arr.max()-x_arr.min()), float(y_arr.max()-y_arr.min()), 1e-6)
-                        if z_range < xy_range * 0.05:
-                            z_mid  = float(z_arr.mean())
-                            z_half = xy_range * 0.04
-                            z_arr  = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
+                        # intensity 캐시 (재계산 방지)
+                        if ft not in stl_mesh_data.get("intensity_cache", {}):
+                            with st.spinner(f"🔄 Mapping {field_options[ft]} → Mesh (first time only)..."):
+                                gate_pos  = np.array([gate_x, gate_y, gate_z])
+                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos)
+                                stl_mesh_data["intensity_cache"][ft] = intensity
+                                st.session_state["_stl_mesh_cache"] = stl_mesh_data
+                        else:
+                            intensity = stl_mesh_data["intensity_cache"][ft]
 
-                        x_span = float(x_arr.max()-x_arr.min()) or 1.0
-                        y_span = float(y_arr.max()-y_arr.min()) or 1.0
-                        z_span = float(z_arr.max()-z_arr.min()) or 1.0
-                        vol_cbrt = max_pts**(1/3)
-                        scale = (x_span*y_span*z_span)**(1/3) or 1.0
-                        nx = min(max(4, int(vol_cbrt*x_span/scale)), 60)
-                        ny = min(max(4, int(vol_cbrt*y_span/scale)), 60)
-                        nz = min(max(2, int(vol_cbrt*z_span/scale)), 20)
-
-                        x_bins = np.linspace(x_arr.min(), x_arr.max(), nx+1)
-                        y_bins = np.linspace(y_arr.min(), y_arr.max(), ny+1)
-                        z_bins = np.linspace(z_arr.min(), z_arr.max(), nz+1)
-                        xi = np.clip(np.digitize(x_arr,x_bins)-1, 0, nx-1)
-                        yi = np.clip(np.digitize(y_arr,y_bins)-1, 0, ny-1)
-                        zi = np.clip(np.digitize(z_arr,z_bins)-1, 0, nz-1)
-
-                        vox_val = np.full((nx,ny,nz), np.nan)
-                        vox_cnt = np.zeros((nx,ny,nz), dtype=int)
-                        for idx in range(len(_df)):
-                            ii,jj,kk = xi[idx],yi[idx],zi[idx]
-                            vox_val[ii,jj,kk] = v_arr[idx] if np.isnan(vox_val[ii,jj,kk]) else vox_val[ii,jj,kk]+v_arr[idx]
-                            vox_cnt[ii,jj,kk] += 1
-                        f = vox_cnt > 0
-                        vox_val[f] /= vox_cnt[f]
-
-                        # 이웃 보간 (빈 voxel)
-                        for _ in range(3):
-                            empty = np.isnan(vox_val)
-                            if not empty.any(): break
-                            pad = np.pad(vox_val, 1, constant_values=np.nan)
-                            ss = np.zeros((nx,ny,nz)); sc = np.zeros((nx,ny,nz))
-                            for di in range(3):
-                                for dj in range(3):
-                                    for dk in range(3):
-                                        if di==1 and dj==1 and dk==1: continue
-                                        sl = pad[di:di+nx, dj:dj+ny, dk:dk+nz]
-                                        v  = ~np.isnan(sl)
-                                        ss += np.where(v, sl, 0); sc += v.astype(float)
-                            fm = empty & (sc>0); vox_val[fm] = ss[fm]/sc[fm]
-
-                        cx=(x_bins[:-1]+x_bins[1:])/2; cy=(y_bins[:-1]+y_bins[1:])/2; cz=(z_bins[:-1]+z_bins[1:])/2
-                        dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
-                        face_defs=[
-                            [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],
-                            [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],
-                            [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],
-                            [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],
-                            [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],
-                            [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],
-                        ]
-                        no=[(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
-                        active = np.argwhere(~np.isnan(vox_val))
-                        all_vx,all_vy,all_vz=[],[],[]
-                        tri_ii,tri_jj,tri_kk=[],[],[]
-                        tri_vals=[]; n_q=0
-                        for (ii,jj,kk) in active:
-                            vc=float(vox_val[ii,jj,kk]); ox,oy,oz=float(cx[ii]),float(cy[jj]),float(cz[kk])
-                            for fi,corners in enumerate(face_defs):
-                                ni,nj,nk=ii+no[fi][0],jj+no[fi][1],kk+no[fi][2]
-                                if 0<=ni<nx and 0<=nj<ny and 0<=nk<nz and not np.isnan(vox_val[ni,nj,nk]):
-                                    continue
-                                base=n_q*4
-                                for cx_,cy_,cz_ in corners:
-                                    all_vx.append(ox+cx_); all_vy.append(oy+cy_); all_vz.append(oz+cz_)
-                                tri_ii.append(base); tri_jj.append(base+1); tri_kk.append(base+2); tri_vals.append(vc)
-                                tri_ii.append(base); tri_jj.append(base+2); tri_kk.append(base+3); tri_vals.append(vc)
-                                n_q+=1
-                        if n_q == 0:
-                            return None
-                        return {
-                            "x":np.array(all_vx,dtype=np.float32), "y":np.array(all_vy,dtype=np.float32),
-                            "z":np.array(all_vz,dtype=np.float32),
-                            "i":np.array(tri_ii,dtype=np.int32), "j":np.array(tri_jj,dtype=np.int32),
-                            "k":np.array(tri_kk,dtype=np.int32),
-                            "facecolor":np.array(tri_vals,dtype=np.float32), "n_cells":n_q,
-                        }
-
-                    # ── 렌더링 ───────────────────────────────────────────────
-                    cell_data = _build_cell_mesh(cae_df, ft)
-                    if cell_data is not None:
                         fig3d.add_trace(go.Mesh3d(
-                            x=cell_data["x"], y=cell_data["y"], z=cell_data["z"],
-                            i=cell_data["i"], j=cell_data["j"], k=cell_data["k"],
-                            intensity=cell_data["facecolor"],
-                            intensitymode="cell",
+                            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+                            intensity=intensity,
                             colorscale=colorscales[ft],
                             colorbar=dict(
                                 title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                 tickfont=dict(color="#e2e8f0"), x=1.02,
                             ),
                             opacity=1.0,
-                            flatshading=True,
-                            lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
-                            name=f"{field_options[ft]} (Cell Mesh)",
+                            flatshading=False,
+                            lighting=dict(ambient=0.5, diffuse=0.8, specular=0.3, roughness=0.5),
+                            lightposition=dict(x=1, y=1, z=2),
+                            name=f"{field_options[ft]} (Mesh)",
                             showlegend=True,
                             hovertemplate=(
                                 f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
+                                "X: %{x:.3f} mm | Y: %{y:.3f} mm<extra></extra>"
                             ),
                         ))
-                        _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
-                    else:
-                        st.warning("Cell mesh generation failed — check data.")
-                        _render_label = "No Data"
 
-                    # 유동선단 오버레이 (fill_time)
-                    if ft == "fill_time" and len(front_df) > 0:
-                        fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
-                        fig3d.add_trace(go.Scatter3d(
-                            x=front_df["x"], y=front_df["y"], z=fz,
-                            mode="markers",
-                            marker=dict(size=5, color="#00ffcc", opacity=0.9,
-                                        line=dict(color="#ffffff", width=0.5)),
-                            name="🟢 Flow Front (>85%)", showlegend=True,
-                        ))
+                        # 유동선단 오버레이
+                        if ft == "fill_time" and len(front_df) > 0:
+                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=fz,
+                                mode="markers",
+                                marker=dict(size=5, color="#00ffcc", opacity=0.9,
+                                            line=dict(color="#ffffff", width=0.5)),
+                                name="🟢 Flow Front (>85%)", showlegend=True,
+                            ))
+
+                    else:
+                        # ── STL 없음: Cell Mesh (CAE 포인트 기반) ───────────
+                        def _build_cell_mesh(df_in, field_col, max_pts=8000):
+                            _df = df_in.copy()
+                            if len(_df) == 0:
+                                return None
+                            x_arr = _df["x"].values.astype(float)
+                            y_arr = _df["y"].values.astype(float)
+                            z_arr = _df["z"].values.astype(float) if "z" in _df.columns else np.zeros(len(_df))
+                            v_arr = _df[field_col].values.astype(float)
+                            z_range  = float(z_arr.max() - z_arr.min())
+                            xy_range = max(float(x_arr.max()-x_arr.min()), float(y_arr.max()-y_arr.min()), 1e-6)
+                            if z_range < xy_range * 0.05:
+                                z_mid = float(z_arr.mean()); z_half = xy_range * 0.04
+                                z_arr = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
+                            x_span = float(x_arr.max()-x_arr.min()) or 1.0
+                            y_span = float(y_arr.max()-y_arr.min()) or 1.0
+                            z_span = float(z_arr.max()-z_arr.min()) or 1.0
+                            vol_cbrt = max_pts**(1/3); scale = (x_span*y_span*z_span)**(1/3) or 1.0
+                            nx=min(max(4,int(vol_cbrt*x_span/scale)),60)
+                            ny=min(max(4,int(vol_cbrt*y_span/scale)),60)
+                            nz=min(max(2,int(vol_cbrt*z_span/scale)),20)
+                            x_bins=np.linspace(x_arr.min(),x_arr.max(),nx+1)
+                            y_bins=np.linspace(y_arr.min(),y_arr.max(),ny+1)
+                            z_bins=np.linspace(z_arr.min(),z_arr.max(),nz+1)
+                            xi=np.clip(np.digitize(x_arr,x_bins)-1,0,nx-1)
+                            yi=np.clip(np.digitize(y_arr,y_bins)-1,0,ny-1)
+                            zi=np.clip(np.digitize(z_arr,z_bins)-1,0,nz-1)
+                            vox_val=np.full((nx,ny,nz),np.nan); vox_cnt=np.zeros((nx,ny,nz),dtype=int)
+                            for idx in range(len(_df)):
+                                ii,jj,kk=xi[idx],yi[idx],zi[idx]
+                                vox_val[ii,jj,kk]=v_arr[idx] if np.isnan(vox_val[ii,jj,kk]) else vox_val[ii,jj,kk]+v_arr[idx]
+                                vox_cnt[ii,jj,kk]+=1
+                            f=vox_cnt>0; vox_val[f]/=vox_cnt[f]
+                            for _ in range(3):
+                                empty=np.isnan(vox_val)
+                                if not empty.any(): break
+                                pad=np.pad(vox_val,1,constant_values=np.nan)
+                                ss=np.zeros((nx,ny,nz)); sc=np.zeros((nx,ny,nz))
+                                for di in range(3):
+                                    for dj in range(3):
+                                        for dk in range(3):
+                                            if di==1 and dj==1 and dk==1: continue
+                                            sl=pad[di:di+nx,dj:dj+ny,dk:dk+nz]; v=~np.isnan(sl)
+                                            ss+=np.where(v,sl,0); sc+=v.astype(float)
+                                fm=empty&(sc>0); vox_val[fm]=ss[fm]/sc[fm]
+                            cx=(x_bins[:-1]+x_bins[1:])/2; cy=(y_bins[:-1]+y_bins[1:])/2; cz=(z_bins[:-1]+z_bins[1:])/2
+                            dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
+                            face_defs=[
+                                [(dx2,-dy2,-dz2),(dx2,dy2,-dz2),(dx2,dy2,dz2),(dx2,-dy2,dz2)],
+                                [(-dx2,dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2,dz2),(-dx2,dy2,dz2)],
+                                [(dx2,dy2,-dz2),(-dx2,dy2,-dz2),(-dx2,dy2,dz2),(dx2,dy2,dz2)],
+                                [(-dx2,-dy2,-dz2),(dx2,-dy2,-dz2),(dx2,-dy2,dz2),(-dx2,-dy2,dz2)],
+                                [(-dx2,-dy2,dz2),(dx2,-dy2,dz2),(dx2,dy2,dz2),(-dx2,dy2,dz2)],
+                                [(-dx2,dy2,-dz2),(dx2,dy2,-dz2),(dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],
+                            ]
+                            no=[(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+                            active=np.argwhere(~np.isnan(vox_val))
+                            all_vx,all_vy,all_vz=[],[],[]; tri_ii,tri_jj,tri_kk=[],[],[]; tri_vals=[]; n_q=0
+                            for (ii,jj,kk) in active:
+                                vc=float(vox_val[ii,jj,kk]); ox,oy,oz=float(cx[ii]),float(cy[jj]),float(cz[kk])
+                                for fi,corners in enumerate(face_defs):
+                                    ni,nj,nk=ii+no[fi][0],jj+no[fi][1],kk+no[fi][2]
+                                    if 0<=ni<nx and 0<=nj<ny and 0<=nk<nz and not np.isnan(vox_val[ni,nj,nk]):
+                                        continue
+                                    base=n_q*4
+                                    for cx_,cy_,cz_ in corners:
+                                        all_vx.append(ox+cx_); all_vy.append(oy+cy_); all_vz.append(oz+cz_)
+                                    tri_ii.append(base); tri_jj.append(base+1); tri_kk.append(base+2); tri_vals.append(vc)
+                                    tri_ii.append(base); tri_jj.append(base+2); tri_kk.append(base+3); tri_vals.append(vc)
+                                    n_q+=1
+                            if n_q==0: return None
+                            return {"x":np.array(all_vx,dtype=np.float32),"y":np.array(all_vy,dtype=np.float32),
+                                    "z":np.array(all_vz,dtype=np.float32),
+                                    "i":np.array(tri_ii,dtype=np.int32),"j":np.array(tri_jj,dtype=np.int32),
+                                    "k":np.array(tri_kk,dtype=np.int32),
+                                    "facecolor":np.array(tri_vals,dtype=np.float32),"n_cells":n_q}
+
+                        cell_data = _build_cell_mesh(cae_df, ft)
+                        if cell_data is not None:
+                            fig3d.add_trace(go.Mesh3d(
+                                x=cell_data["x"], y=cell_data["y"], z=cell_data["z"],
+                                i=cell_data["i"], j=cell_data["j"], k=cell_data["k"],
+                                intensity=cell_data["facecolor"], intensitymode="cell",
+                                colorscale=colorscales[ft],
+                                colorbar=dict(
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                ),
+                                opacity=1.0, flatshading=True,
+                                lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
+                                name=f"{field_options[ft]} (Cell Mesh)", showlegend=True,
+                                hovertemplate=(f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
+                                               "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"),
+                            ))
+                        else:
+                            st.warning("Cell mesh generation failed — check data.")
+
+                        if ft == "fill_time" and len(front_df) > 0:
+                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=front_df["x"], y=front_df["y"], z=fz, mode="markers",
+                                marker=dict(size=5, color="#00ffcc", opacity=0.9,
+                                            line=dict(color="#ffffff", width=0.5)),
+                                name="🟢 Flow Front (>85%)", showlegend=True,
+                            ))
+
+                        st.info("💡 Upload an STL file to display contours on the actual geometry surface.")
 
                     # 게이트 마커 공통
                     fig3d.add_trace(_gate_trace_3d(gate_z))
