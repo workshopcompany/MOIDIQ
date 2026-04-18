@@ -587,9 +587,9 @@ def style_verdict_df(df, verdict_col="판정"):
 def _check_github_secrets() -> bool:
     """Streamlit secrets에 GITHUB_TOKEN이 유효하게 설정됐는지 확인."""
     try:
-        token = st.secrets["GITHUB_TOKEN"]
+        token = st.secrets.get("GITHUB_TOKEN", "")
         return bool(token and str(token).strip() and str(token) != "ghp_xxxxxxxxxxxx")
-    except (KeyError, FileNotFoundError, Exception):
+    except Exception:
         return False
 
 
@@ -995,7 +995,7 @@ elif current_stage == "stage1":
                     """GitHub API로 artifacts 목록 직접 조회."""
                     try:
                         # 1. 토큰 및 설정 로드
-                        token = st.secrets["GITHUB_TOKEN"]
+                        token = st.secrets.get("GITHUB_TOKEN", "")
                         
                         # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
                         # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
