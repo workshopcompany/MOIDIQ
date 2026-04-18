@@ -1561,56 +1561,140 @@ elif current_stage == "stage1":
                             "nx":nx, "ny":ny, "nz":nz,
                         }
 
-                    _stl_verts_for_mask = stl_mesh_data["vertices"] if stl_mesh_data is not None else None
-                    with st.spinner(f"🔄 Building Cell Mesh (cell ≈ {_avg_t/10:.2f} mm)..."):
-                        cell_data = _build_cell_mesh(cae_df, ft, avg_thickness=_avg_t,
-                                                     stl_verts=_stl_verts_for_mask)
+                    # ── 렌더링 모드 선택 ────────────────────────────────
+                    render_mode = st.radio(
+                        "🎨 렌더링 모드",
+                        ["🔬 Isosurface (Solid — 권장)", "🟦 Cell Mesh (Voxel)"],
+                        horizontal=True,
+                        key=f"render_mode_{ft}",
+                        help="Isosurface: 등치면 기반 매끄러운 솔리드 렌더링 | Cell Mesh: 복셀 격자 렌더링",
+                    )
+                    use_isosurface = render_mode.startswith("🔬")
 
-                    if cell_data is not None:
-                        _cs = cell_data.get("cell_size", _avg_t / 10)
-                        fig3d.add_trace(go.Mesh3d(
-                            x=cell_data["x"], y=cell_data["y"], z=cell_data["z"],
-                            i=cell_data["i"], j=cell_data["j"], k=cell_data["k"],
-                            intensity=cell_data["facecolor"], intensitymode="cell",
-                            colorscale=colorscales[ft],
-                            colorbar=dict(
-                                title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                tickfont=dict(color="#e2e8f0"), x=1.02,
-                            ),
-                            opacity=1.0, flatshading=True,
-                            lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
-                            name=f"{field_options[ft]} (Cell Mesh · {_cs:.2f} mm/cell)",
-                            showlegend=True,
-                            hovertemplate=(
-                                f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
-                            ),
-                        ))
+                    if use_isosurface:
+                        # ════════════════════════════════════════════════
+                        #  Isosurface 렌더링
+                        #  · 해석 데이터(x,y,z,value)로 직접 등치면 계산
+                        #  · STL 불필요 — 데이터 자체가 형상을 만든다
+                        # ════════════════════════════════════════════════
+                        iso_col1, iso_col2 = st.columns(2)
+                        with iso_col1:
+                            surface_count = st.slider(
+                                "등치면 레이어 수", 3, 15, 7, 1,
+                                key=f"iso_surfaces_{ft}",
+                                help="층 수가 많을수록 디테일하지만 느려집니다",
+                            )
+                        with iso_col2:
+                            iso_opacity = st.slider(
+                                "투명도", 0.3, 1.0, 1.0, 0.05,
+                                key=f"iso_opacity_{ft}",
+                                help="1.0 = 완전 불투명 Solid | 0.6 = 내부 투시 가능",
+                            )
+
+                        # 포인트 수 제한 (브라우저 성능 보호: 최대 20,000)
+                        _iso_n = min(len(cae_df), 20000)
+                        vdf = cae_df.sample(_iso_n, random_state=42) if len(cae_df) > _iso_n else cae_df.copy()
+                        _iso_z = vdf["z"].values if has_z_global else np.zeros(len(vdf))
+
+                        with st.spinner(f"🔄 Isosurface 계산 중 ({_iso_n:,}pts × {surface_count} layers)..."):
+                            fig3d.add_trace(go.Isosurface(
+                                x=vdf["x"].values,
+                                y=vdf["y"].values,
+                                z=_iso_z,
+                                value=vdf[ft].values,
+                                isomin=float(vdf[ft].min()),
+                                isomax=float(vdf[ft].max()),
+                                surface_count=surface_count,
+                                opacity=iso_opacity,
+                                caps=dict(x_show=True, y_show=True, z_show=True),
+                                colorscale=colorscales[ft],
+                                colorbar=dict(
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                ),
+                                flatshading=True,
+                                lighting=dict(ambient=0.8, diffuse=0.6, specular=0.2, roughness=0.5),
+                                name=f"{field_options[ft]} (Isosurface · {surface_count} layers)",
+                                showlegend=True,
+                                hovertemplate=(
+                                    f"<b>{field_options[ft]}: %{{value:.2f}}</b><br>"
+                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
+                                ),
+                            ))
+
+                        # STL 투명 윤곽선 오버레이 (형상 참고용)
+                        if stl_mesh_data is not None:
+                            _sv = stl_mesh_data["vertices"]
+                            _sf = stl_mesh_data["faces"]
+                            fig3d.add_trace(go.Mesh3d(
+                                x=_sv[:, 0], y=_sv[:, 1], z=_sv[:, 2],
+                                i=_sf[:, 0], j=_sf[:, 1], k=_sf[:, 2],
+                                color="#88aacc", opacity=0.08,
+                                flatshading=True,
+                                name="STL Outline (ref)",
+                                showlegend=True, hoverinfo="skip",
+                            ))
+
                         st.caption(
-                            f"📐 Grid: **{cell_data['nx']} × {cell_data['ny']} × {cell_data['nz']}** cells"
-                            f" | cell size ≈ **{_cs:.3f} mm**"
-                            f" (avg_thickness {_avg_t:.1f} mm ÷ 10)"
-                            + (f" | ✂️ STL XY 마스킹 적용 (형상 밖 셀 제거됨)" if stl_mesh_data else
-                               f" | ✂️ CAE 포인트 경계 마스킹 적용")
+                            f"🔬 Isosurface: **{_iso_n:,}pts** × **{surface_count} layers** | "
+                            f"투명도 {iso_opacity:.2f}"
+                            + (" | +STL 윤곽선" if stl_mesh_data else "")
                         )
+                        _title_mode = f"Isosurface · {surface_count}L"
+
                     else:
-                        st.warning("Cell mesh generation failed — check data.")
+                        # ════════════════════════════════════════════════
+                        #  Cell Mesh (Voxel) 렌더링 — 기존 방식 유지
+                        # ════════════════════════════════════════════════
+                        _stl_verts_for_mask = stl_mesh_data["vertices"] if stl_mesh_data is not None else None
+                        with st.spinner(f"🔄 Building Cell Mesh (cell ≈ {_avg_t/10:.2f} mm)..."):
+                            cell_data = _build_cell_mesh(cae_df, ft, avg_thickness=_avg_t,
+                                                         stl_verts=_stl_verts_for_mask)
 
-                    # ── STL이 있으면 투명 윤곽선으로 오버레이 (형상 참고용) ──
-                    if stl_mesh_data is not None:
-                        _sv = stl_mesh_data["vertices"]
-                        _sf = stl_mesh_data["faces"]
-                        fig3d.add_trace(go.Mesh3d(
-                            x=_sv[:, 0], y=_sv[:, 1], z=_sv[:, 2],
-                            i=_sf[:, 0], j=_sf[:, 1], k=_sf[:, 2],
-                            color="#88aacc", opacity=0.10,
-                            flatshading=True,
-                            name="STL Outline (ref)",
-                            showlegend=True,
-                            hoverinfo="skip",
-                        ))
+                        if cell_data is not None:
+                            _cs = cell_data.get("cell_size", _avg_t / 10)
+                            fig3d.add_trace(go.Mesh3d(
+                                x=cell_data["x"], y=cell_data["y"], z=cell_data["z"],
+                                i=cell_data["i"], j=cell_data["j"], k=cell_data["k"],
+                                intensity=cell_data["facecolor"], intensitymode="cell",
+                                colorscale=colorscales[ft],
+                                colorbar=dict(
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                ),
+                                opacity=1.0, flatshading=True,
+                                lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
+                                name=f"{field_options[ft]} (Cell Mesh · {_cs:.2f} mm/cell)",
+                                showlegend=True,
+                                hovertemplate=(
+                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
+                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
+                                ),
+                            ))
+                            st.caption(
+                                f"📐 Grid: **{cell_data['nx']} × {cell_data['ny']} × {cell_data['nz']}** cells"
+                                f" | cell size ≈ **{_cs:.3f} mm**"
+                                f" (avg_thickness {_avg_t:.1f} mm ÷ 10)"
+                                + (f" | ✂️ STL 마스킹" if stl_mesh_data else f" | ✂️ CAE 경계 마스킹")
+                            )
+                        else:
+                            st.warning("Cell mesh generation failed — check data.")
 
-                    # 유동선단 오버레이
+                        # STL 투명 윤곽선 오버레이
+                        if stl_mesh_data is not None:
+                            _sv = stl_mesh_data["vertices"]
+                            _sf = stl_mesh_data["faces"]
+                            fig3d.add_trace(go.Mesh3d(
+                                x=_sv[:, 0], y=_sv[:, 1], z=_sv[:, 2],
+                                i=_sf[:, 0], j=_sf[:, 1], k=_sf[:, 2],
+                                color="#88aacc", opacity=0.10,
+                                flatshading=True, name="STL Outline (ref)",
+                                showlegend=True, hoverinfo="skip",
+                            ))
+
+                        _title_mode = f"Cell Mesh — {_avg_t/10:.2f} mm/cell"
+
+                    # ── 유동선단 오버레이 (공통) ────────────────────────
                     if ft == "fill_time" and len(front_df) > 0:
                         fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
                         fig3d.add_trace(go.Scatter3d(
@@ -1629,7 +1713,7 @@ elif current_stage == "stage1":
                         title=dict(
                             text=(
                                 f"{field_options[ft]} Distribution"
-                                f"  [Cell Mesh — {_avg_t/10:.2f} mm/cell]"
+                                f"  [{_title_mode}]"
                                 + ("  +STL" if stl_mesh_data else "")
                                 + f"  |  Gate @ ({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm"
                             ),
