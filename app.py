@@ -587,15 +587,15 @@ def style_verdict_df(df, verdict_col="판정"):
 def _check_github_secrets() -> bool:
     """Streamlit secrets에 GITHUB_TOKEN이 유효하게 설정됐는지 확인."""
     try:
-        token = st.secrets.get("GITHUB_TOKEN", "")
+        token = st.secrets["GITHUB_TOKEN"]
         return bool(token and str(token).strip() and str(token) != "ghp_xxxxxxxxxxxx")
-    except Exception:
+    except (KeyError, FileNotFoundError, Exception):
         return False
 
 
 def _show_github_token_guide():
     """GitHub Token 미설정 시 단계별 안내 UI 표시."""
-    st.error("🔑 **GITHUB_TOKEN이 설정되지 않았습니다.**")
+    st.error("🔑 **GITHUB_TOKEN is not configured.**")
     with st.expander("📋 설정 방법 — 클릭해서 펼치기", expanded=True):
         st.markdown("""
 **Streamlit Cloud를 사용하는 경우:**
@@ -995,15 +995,15 @@ elif current_stage == "stage1":
                     """GitHub API로 artifacts 목록 직접 조회."""
                     try:
                         # 1. 토큰 및 설정 로드
-                        token = st.secrets.get("GITHUB_TOKEN", "")
+                        token = st.secrets["GITHUB_TOKEN"]
                         
                         # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
                         # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
                         owner = st.secrets.get("OPENFOAM_REPO_OWNER") or st.secrets.get("REPO_OWNER") or "workshopcompany"
-                        repo  = st.secrets.get("OPENFOAM_REPO_NAME")  or st.secrets.get("REPO_NAME")  or "OpenFOAM-Injection-Automation"
+                        repo  = st.secrets.get("OPENFOAM_REPO_NAME") or st.secrets.get("REPO_NAME") or "OpenFOAM-Injection-Automation"
                         
                     except (KeyError, FileNotFoundError):
-                        raise RuntimeError("GITHUB_TOKEN이 .streamlit/secrets.toml에 없습니다.")
+                        raise RuntimeError("GITHUB_TOKEN not found in secrets.")
 
                     # 2. GitHub API 호출 (최신순 조회를 위해 per_page 상향)
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
@@ -1018,41 +1018,41 @@ elif current_stage == "stage1":
                         resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
                         
                         if resp.status_code == 401:
-                            raise RuntimeError("GITHUB_TOKEN이 유효하지 않거나 권한이 없습니다 (401).")
+                            raise RuntimeError("GITHUB_TOKEN is invalid or lacks permissions (401).")
                         if resp.status_code == 404:
-                            raise RuntimeError(f"저장소를 찾을 수 없습니다: {owner}/{repo} (404)")
+                            raise RuntimeError(f"Repository not found: {owner}/{repo} (404)")
                         
                         resp.raise_for_status()
                         return resp.json().get("artifacts", [])
                     except requests.exceptions.RequestException as e:
-                        raise RuntimeError(f"GitHub 연결 실패: {str(e)}")
+                        raise RuntimeError(f"GitHub connection failed: {str(e)}")
 
                 # --- 버튼 클릭 시 실행 로직 ---
                 if not _check_github_secrets(): # 기존 코드에 있는 체크 함수 호출
                     _show_github_token_guide()
                 else:
                     try:
-                        with st.spinner("GitHub에서 시뮬레이션 결과 목록을 가져오는 중..."):
+                        with st.spinner("Fetching simulation results from GitHub..."):
                             artifacts = _fetch_artifacts_direct(per_page=30)
                         
                         if artifacts:
-                            st.success(f"✅ {len(artifacts)}개의 시뮬레이션 결과 발견")
-                            st.info("아래 목록의 '아티팩트 이름'에서 'simulation-' 뒤의 문구(예: cf22322a)를 Signal ID에 입력하세요.")
+                            st.success(f"✅ Found {len(artifacts)} simulation result(s)")
+                            st.info("Copy the value after 'simulation-' (e.g. cf22322a) from the Artifact Name column and use it as your Signal ID.")
                             
                             # 사용자에게 보여줄 데이터 프레임 구성
                             display_data = []
                             for a in artifacts:
                                 # 'simulation-'으로 시작하는 파일만 필터링하거나 강조할 수 있습니다.
                                 display_data.append({
-                                    "아티팩트 이름": a["name"],
-                                    "생성일": a["created_at"].replace("T", " ").replace("Z", ""),
-                                    "크기(MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
-                                    "상태": "사용 가능" if not a.get("expired") else "만료됨"
+                                    "Artifact Name": a["name"],
+                                    "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
+                                    "Size (MB)": f"{a.get('size_in_bytes', 0)/1024/1024:.2f}",
+                                    "Status": "Available" if not a.get("expired") else "Expired"
                                 })
                             
                             st.dataframe(display_data, use_container_width=True, hide_index=True)
                         else:
-                            st.warning("⚠️ 아티팩트가 없습니다. GitHub Actions에서 시뮬레이션이 완료되었는지 확인하세요.")
+                            st.warning("⚠️ No artifacts found. Check that your GitHub Actions simulation has completed.")
                             
                     except RuntimeError as e:
                         st.error(str(e))
