@@ -179,7 +179,10 @@ def _download_artifact_zip(artifact: dict) -> bytes:
 
 
 def _parse_results_from_zip(zip_bytes: bytes) -> dict:
-    """ZIP에서 results.json (우선) 또는 results.txt 파싱."""
+    """
+    ZIP에서 results.json (우선) 또는 results.txt 파싱.
+    results.json 안에 voxel_coords / flow_weights 배열이 있으면 함께 반환.
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
         names = z.namelist()
 
@@ -189,7 +192,7 @@ def _parse_results_from_zip(zip_bytes: bytes) -> dict:
             with z.open(json_files[0]) as f:
                 return json.load(f)
 
-        # results.txt fallback
+        # results.txt fallback (voxel 데이터 없음)
         txt_files = [n for n in names if n.endswith("results.txt")]
         if txt_files:
             with z.open(txt_files[0]) as f:
@@ -210,6 +213,57 @@ def _parse_results_from_zip(zip_bytes: bytes) -> dict:
 # ══════════════════════════════════════════════════════════
 #  CAE DataFrame 생성
 # ══════════════════════════════════════════════════════════
+
+def _build_cae_from_voxels(meta: dict) -> pd.DataFrame:
+    """
+    results.json에 voxel_coords + flow_weights 배열이 있을 때
+    실제 솔버 좌표 그대로 DataFrame 생성 (복셀화/재계산 없음).
+    """
+    coords  = np.array(meta["voxel_coords"],  dtype=np.float32)  # (N,3)
+    weights = np.array(meta["flow_weights"],  dtype=np.float32)  # (N,)
+
+    def _val(key, default):
+        for k in [key, key.lower(), key.replace(" ", "_"), key.replace("_", " ")]:
+            if k in meta:
+                try:
+                    return float(meta[k])
+                except (ValueError, TypeError):
+                    pass
+        return default
+
+    theo_fill_time = _val("Theo Fill Time (s)", 1.0)
+    material       = str(meta.get("Material", "17-4PH"))
+
+    _props = {
+        "17-4PH":   {"melt_temp": 185, "mold_temp": 40, "max_pressure": 120},
+        "316L":     {"melt_temp": 185, "mold_temp": 40, "max_pressure": 115},
+        "Ti-6Al-4V":{"melt_temp": 195, "mold_temp": 45, "max_pressure": 130},
+        "PC+ABS":   {"melt_temp": 245, "mold_temp": 70, "max_pressure":  90},
+        "PA66":     {"melt_temp": 290, "mold_temp": 85, "max_pressure": 100},
+        "ABS":      {"melt_temp": 230, "mold_temp": 60, "max_pressure":  85},
+    }
+    props  = _props.get(material, _props["17-4PH"])
+    T_melt = props["melt_temp"]
+    T_mold = props["mold_temp"]
+    P_max  = props["max_pressure"]
+
+    # flow_weights: 0=gate, 1=최원단 → 물리량 역산
+    w = weights
+    fill_time   = w * theo_fill_time
+    pressure    = np.clip(P_max * (1.0 - w * 0.75), 0, P_max * 1.05)
+    temperature = np.clip(T_melt - (T_melt - T_mold) * w * 0.6, T_mold, T_melt + 10)
+
+    return pd.DataFrame({
+        "x":           np.round(coords[:, 0], 3),
+        "y":           np.round(coords[:, 1], 3),
+        "z":           np.round(coords[:, 2], 3),
+        "pressure":    np.round(pressure,    3),
+        "temperature": np.round(temperature, 3),
+        "fill_time":   np.round(fill_time,   4),
+        "flow_weight": np.round(w,           4),   # 원본 Dijkstra 가중치 보존
+        "material":    material,
+        "signal_id":   str(meta.get("Signal ID", "")),
+    })
 
 def _build_cae_dataframe(meta: dict, n_points: int = 500) -> pd.DataFrame:
     """
@@ -330,7 +384,13 @@ def generate_flow_csv_from_github(
     # 3. 다운로드 & 파싱
     zip_bytes = _download_artifact_zip(target)
     meta      = _parse_results_from_zip(zip_bytes)
-    df        = _build_cae_dataframe(meta, n_points=n_points)
+
+    # 4. voxel_coords + flow_weights 있으면 실제 솔버 좌표 사용
+    #    없으면 기존 방식(메타데이터 기반 근사 생성) fallback
+    if "voxel_coords" in meta and "flow_weights" in meta:
+        df = _build_cae_from_voxels(meta)
+    else:
+        df = _build_cae_dataframe(meta, n_points=n_points)
 
     return df
 
