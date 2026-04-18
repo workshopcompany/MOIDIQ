@@ -1084,7 +1084,7 @@ elif current_stage == "stage1":
                     if not _github_ok:
                         _show_github_token_guide()
                     else:
-                        with st.spinner(f"'{signal_id.strip()}' 결과 가져오는 중..."):
+                        with st.spinner(f"Loading '{signal_id.strip()}' results..."):
                             try:
                                 cae_df = generate_flow_csv_from_github(signal_id.strip())
                                 st.session_state["cae_df"] = cae_df
@@ -1140,7 +1140,7 @@ elif current_stage == "stage1":
             - **ZIP 파일** (`internal.vtu` 포함): 시뮬레이션 결과 폴더 전체를 압축한 .zip
             - **단일 VTU 파일** (`internal.vtu`): 내부 솔리드 메쉬 데이터
 
-            > 📌 업로드하면 압력(p), 속도(U) 등 **실제 OpenFOAM 계산값**으로 CSV가 자동 생성됩니다.
+            > 📌 Uploading will auto-generate a CSV from actual OpenFOAM computed values (pressure p, velocity U, etc.).
             """)
 
             vtk_col1, vtk_col2 = st.columns([3, 1])
@@ -1157,7 +1157,7 @@ elif current_stage == "stage1":
                                         use_container_width=True, type="primary")
 
             if vtk_upload and vtk_gen_btn:
-                with st.spinner("VTK 파일 파싱 중..."):
+                with st.spinner("Parsing VTK file..."):
                     try:
                         raw = vtk_upload.getvalue()
                         ext = vtk_upload.name.lower().split(".")[-1]
@@ -1204,7 +1204,7 @@ elif current_stage == "stage1":
             st.info("💡 위에서 Signal ID로 CSV 생성하거나, Option B로 CSV를 업로드한 뒤 분석을 실행하세요.")
 
         if st.button(T["btn_st1"], type="primary", use_container_width=True):
-            with st.spinner(T.get("st1_analyzing", "분석 중...")):
+            with st.spinner(T.get("st1_analyzing", "Analyzing...")):
                 try:
                     cae_df = st.session_state.get("cae_df")
                     if cae_df is None:
@@ -1345,7 +1345,7 @@ elif current_stage == "stage1":
             # [FIX-2] Mold Concept에서 업로드된 STL 자동 로드
             auto_stl_bytes = st.session_state.get("stl_bytes")
             if auto_stl_bytes is not None and stl_mesh_data is None:
-                with st.spinner("🔄 Mold Concept에서 업로드된 STL 자동 로드 중..."):
+                with st.spinner("🔄 Auto-loading STL from Mold Concept..."):
                     try:
                         _av, _af = _parse_stl_binary(auto_stl_bytes)
                         st.session_state["_stl_mesh_cache"] = {
@@ -1365,7 +1365,7 @@ elif current_stage == "stage1":
             stl_col1, stl_col2 = st.columns([3, 1])
             with stl_col1:
                 _uploader_label = (
-                    "🗂️ STL 파일 업로드 (형상 위에 분포도 표시)"
+                    "🗂️ Upload STL File (overlay contour on geometry)"
                     if stl_mesh_data is None
                     else "🔄 다른 STL로 교체하려면 업로드"
                 )
@@ -1381,7 +1381,7 @@ elif current_stage == "stage1":
                     st.success(f"✅ {stl_mesh_data['name']}\n({stl_mesh_data['n_faces']:,} faces)")
 
             if stl_upload_field is not None:
-                with st.spinner("STL 파싱 중..."):
+                with st.spinner("Parsing STL..."):
                     try:
                         file_bytes = stl_upload_field.read()
                         verts, faces = _parse_stl_binary(file_bytes)
@@ -1437,105 +1437,139 @@ elif current_stage == "stage1":
 
                     fig3d = go.Figure()
 
-                    # ── 분기: STL 있으면 Mesh3d, 없으면 개선된 Scatter3d ──
-                    if stl_mesh_data is not None:
-                        verts  = stl_mesh_data["vertices"]
-                        faces  = stl_mesh_data["faces"]
+                    # ── Cell Mesh 빌더 (CAE 포인트 → 3D Voxel Grid) ─────────
+                    def _build_cell_mesh(df_in, field_col, max_pts=8000):
+                        _df = df_in.copy()
+                        if len(_df) == 0:
+                            return None
+                        x_arr = _df["x"].values.astype(float)
+                        y_arr = _df["y"].values.astype(float)
+                        z_arr = _df["z"].values.astype(float) if "z" in _df.columns else np.zeros(len(_df))
+                        v_arr = _df[field_col].values.astype(float)
 
-                        # 인텐시티 캐시 (재계산 방지)
-                        if ft not in stl_mesh_data.get("intensity_cache", {}):
-                            with st.spinner(f"🔄 {field_options[ft]} → Mesh 매핑 중 (최초 1회)..."):
-                                gate_pos = np.array([gate_x, gate_y, gate_z])
-                                intensity = _map_cae_to_mesh(verts, cae_df, ft, gate_pos)
-                                stl_mesh_data["intensity_cache"][ft] = intensity
-                                st.session_state["_stl_mesh_cache"] = stl_mesh_data
-                        else:
-                            intensity = stl_mesh_data["intensity_cache"][ft]
+                        # 납작한 형상이면 두께 보정
+                        z_range  = float(z_arr.max() - z_arr.min())
+                        xy_range = max(float(x_arr.max()-x_arr.min()), float(y_arr.max()-y_arr.min()), 1e-6)
+                        if z_range < xy_range * 0.05:
+                            z_mid  = float(z_arr.mean())
+                            z_half = xy_range * 0.04
+                            z_arr  = np.where(z_arr <= z_mid, z_mid - z_half, z_mid + z_half)
 
+                        x_span = float(x_arr.max()-x_arr.min()) or 1.0
+                        y_span = float(y_arr.max()-y_arr.min()) or 1.0
+                        z_span = float(z_arr.max()-z_arr.min()) or 1.0
+                        vol_cbrt = max_pts**(1/3)
+                        scale = (x_span*y_span*z_span)**(1/3) or 1.0
+                        nx = min(max(4, int(vol_cbrt*x_span/scale)), 60)
+                        ny = min(max(4, int(vol_cbrt*y_span/scale)), 60)
+                        nz = min(max(2, int(vol_cbrt*z_span/scale)), 20)
+
+                        x_bins = np.linspace(x_arr.min(), x_arr.max(), nx+1)
+                        y_bins = np.linspace(y_arr.min(), y_arr.max(), ny+1)
+                        z_bins = np.linspace(z_arr.min(), z_arr.max(), nz+1)
+                        xi = np.clip(np.digitize(x_arr,x_bins)-1, 0, nx-1)
+                        yi = np.clip(np.digitize(y_arr,y_bins)-1, 0, ny-1)
+                        zi = np.clip(np.digitize(z_arr,z_bins)-1, 0, nz-1)
+
+                        vox_val = np.full((nx,ny,nz), np.nan)
+                        vox_cnt = np.zeros((nx,ny,nz), dtype=int)
+                        for idx in range(len(_df)):
+                            ii,jj,kk = xi[idx],yi[idx],zi[idx]
+                            vox_val[ii,jj,kk] = v_arr[idx] if np.isnan(vox_val[ii,jj,kk]) else vox_val[ii,jj,kk]+v_arr[idx]
+                            vox_cnt[ii,jj,kk] += 1
+                        f = vox_cnt > 0
+                        vox_val[f] /= vox_cnt[f]
+
+                        # 이웃 보간 (빈 voxel)
+                        for _ in range(3):
+                            empty = np.isnan(vox_val)
+                            if not empty.any(): break
+                            pad = np.pad(vox_val, 1, constant_values=np.nan)
+                            ss = np.zeros((nx,ny,nz)); sc = np.zeros((nx,ny,nz))
+                            for di in range(3):
+                                for dj in range(3):
+                                    for dk in range(3):
+                                        if di==1 and dj==1 and dk==1: continue
+                                        sl = pad[di:di+nx, dj:dj+ny, dk:dk+nz]
+                                        v  = ~np.isnan(sl)
+                                        ss += np.where(v, sl, 0); sc += v.astype(float)
+                            fm = empty & (sc>0); vox_val[fm] = ss[fm]/sc[fm]
+
+                        cx=(x_bins[:-1]+x_bins[1:])/2; cy=(y_bins[:-1]+y_bins[1:])/2; cz=(z_bins[:-1]+z_bins[1:])/2
+                        dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
+                        face_defs=[
+                            [( dx2,-dy2,-dz2),( dx2, dy2,-dz2),( dx2, dy2, dz2),( dx2,-dy2, dz2)],
+                            [(-dx2, dy2,-dz2),(-dx2,-dy2,-dz2),(-dx2,-dy2, dz2),(-dx2, dy2, dz2)],
+                            [( dx2, dy2,-dz2),(-dx2, dy2,-dz2),(-dx2, dy2, dz2),( dx2, dy2, dz2)],
+                            [(-dx2,-dy2,-dz2),( dx2,-dy2,-dz2),( dx2,-dy2, dz2),(-dx2,-dy2, dz2)],
+                            [(-dx2,-dy2, dz2),( dx2,-dy2, dz2),( dx2, dy2, dz2),(-dx2, dy2, dz2)],
+                            [(-dx2, dy2,-dz2),( dx2, dy2,-dz2),( dx2,-dy2,-dz2),(-dx2,-dy2,-dz2)],
+                        ]
+                        no=[(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+                        active = np.argwhere(~np.isnan(vox_val))
+                        all_vx,all_vy,all_vz=[],[],[]
+                        tri_ii,tri_jj,tri_kk=[],[],[]
+                        tri_vals=[]; n_q=0
+                        for (ii,jj,kk) in active:
+                            vc=float(vox_val[ii,jj,kk]); ox,oy,oz=float(cx[ii]),float(cy[jj]),float(cz[kk])
+                            for fi,corners in enumerate(face_defs):
+                                ni,nj,nk=ii+no[fi][0],jj+no[fi][1],kk+no[fi][2]
+                                if 0<=ni<nx and 0<=nj<ny and 0<=nk<nz and not np.isnan(vox_val[ni,nj,nk]):
+                                    continue
+                                base=n_q*4
+                                for cx_,cy_,cz_ in corners:
+                                    all_vx.append(ox+cx_); all_vy.append(oy+cy_); all_vz.append(oz+cz_)
+                                tri_ii.append(base); tri_jj.append(base+1); tri_kk.append(base+2); tri_vals.append(vc)
+                                tri_ii.append(base); tri_jj.append(base+2); tri_kk.append(base+3); tri_vals.append(vc)
+                                n_q+=1
+                        if n_q == 0:
+                            return None
+                        return {
+                            "x":np.array(all_vx,dtype=np.float32), "y":np.array(all_vy,dtype=np.float32),
+                            "z":np.array(all_vz,dtype=np.float32),
+                            "i":np.array(tri_ii,dtype=np.int32), "j":np.array(tri_jj,dtype=np.int32),
+                            "k":np.array(tri_kk,dtype=np.int32),
+                            "facecolor":np.array(tri_vals,dtype=np.float32), "n_cells":n_q,
+                        }
+
+                    # ── 렌더링 ───────────────────────────────────────────────
+                    cell_data = _build_cell_mesh(cae_df, ft)
+                    if cell_data is not None:
                         fig3d.add_trace(go.Mesh3d(
-                            x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
-                            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
-                            intensity=intensity,
+                            x=cell_data["x"], y=cell_data["y"], z=cell_data["z"],
+                            i=cell_data["i"], j=cell_data["j"], k=cell_data["k"],
+                            intensity=cell_data["facecolor"],
+                            intensitymode="cell",
                             colorscale=colorscales[ft],
                             colorbar=dict(
                                 title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                 tickfont=dict(color="#e2e8f0"), x=1.02,
                             ),
                             opacity=1.0,
-                            flatshading=False,       # smooth shading
-                            lighting=dict(ambient=0.5, diffuse=0.8,
-                                          specular=0.3, roughness=0.5),
-                            lightposition=dict(x=1, y=1, z=2),
-                            name=f"{field_options[ft]} (Mesh)",
+                            flatshading=True,
+                            lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
+                            name=f"{field_options[ft]} (Cell Mesh)",
                             showlegend=True,
                             hovertemplate=(
                                 f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                "X: %{x:.3f} mm<br>Y: %{y:.3f} mm<br>"
-                                "Z: %{z:.3f} mm<extra></extra>"
+                                "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
                             ),
                         ))
-
-                        # 유동선단 오버레이 (fill_time 탭)
-                        if ft == "fill_time" and len(front_df) > 0:
-                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
-                            fig3d.add_trace(go.Scatter3d(
-                                x=front_df["x"], y=front_df["y"], z=fz,
-                                mode="markers",
-                                marker=dict(size=5, color="#00ffcc", opacity=0.9,
-                                            line=dict(color="#ffffff", width=0.5)),
-                                name="🟢 Flow Front (>85%)", showlegend=True,
-                            ))
-
+                        _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
                     else:
-                        # ── STL 없음: Scatter3d (개선형, 에러 없음) ─────────
-                        pt_color = cae_df[ft].values
-                        z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
+                        st.warning("Cell mesh generation failed — check data.")
+                        _render_label = "No Data"
 
-                        if ft == "pressure":
-                            pt_size = (4 + 8 * (1 - cae_df["rel_dist"].values)).clip(4, 12).tolist()
-                        else:
-                            pt_size = 7
-
+                    # 유동선단 오버레이 (fill_time)
+                    if ft == "fill_time" and len(front_df) > 0:
+                        fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
                         fig3d.add_trace(go.Scatter3d(
-                            x=cae_df["x"], y=cae_df["y"], z=z_col,
+                            x=front_df["x"], y=front_df["y"], z=fz,
                             mode="markers",
-                            marker=dict(
-                                size=pt_size,
-                                color=pt_color,
-                                colorscale=colorscales[ft],
-                                colorbar=dict(
-                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                    tickfont=dict(color="#e2e8f0"), x=1.02,
-                                ),
-                                opacity=0.85,
-                                line=dict(width=0),
-                            ),
-                            customdata=np.stack([
-                                cae_df[ft].values,
-                                cae_df["rel_dist"].values,
-                                cae_df["fill_time"].values,
-                            ], axis=-1),
-                            hovertemplate=(
-                                f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
-                                "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
-                                "Gate Dist: %{customdata[1]:.0%}<br>"
-                                "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
-                            ),
-                            name=f"{field_options[ft]} (Point Cloud)",
-                            showlegend=True,
+                            marker=dict(size=5, color="#00ffcc", opacity=0.9,
+                                        line=dict(color="#ffffff", width=0.5)),
+                            name="🟢 Flow Front (>85%)", showlegend=True,
                         ))
-
-                        if ft == "fill_time" and len(front_df) > 0:
-                            fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
-                            fig3d.add_trace(go.Scatter3d(
-                                x=front_df["x"], y=front_df["y"], z=fz,
-                                mode="markers",
-                                marker=dict(size=9, color="#00ffcc", opacity=1.0,
-                                            line=dict(color="#ffffff", width=1)),
-                                name="🟢 Flow Front (>85%)", showlegend=True,
-                            ))
-
-                        st.info("💡 STL 파일을 업로드하면 실제 형상 표면에 컨투어가 표시됩니다.")
 
                     # 게이트 마커 공통
                     fig3d.add_trace(_gate_trace_3d(gate_z))
@@ -1555,9 +1589,9 @@ elif current_stage == "stage1":
                     st.plotly_chart(fig3d, use_container_width=True)
 
                     col_gi1, col_gi2, col_gi3 = st.columns(3)
-                    col_gi1.metric("🎯 Gate 절대위치",
+                    col_gi1.metric("🎯 Gate Position",
                                    f"({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm")
-                    col_gi2.metric("📏 최대 유동 거리", f"{max_dist:.2f} mm")
+                    col_gi2.metric("📏 Max Flow Distance", f"{max_dist:.2f} mm")
                     col_gi3.metric("🌊 유동 선단 포인트", f"{len(front_df)}개")
 
             # 통계 지표
@@ -1635,7 +1669,7 @@ elif current_stage == "stage1":
             if solid_df is None:
                 st.warning(
                     "⚠️ Solid Mesh 데이터가 없습니다.\n\n"
-                    "**Data Input 탭 → Option C**에서 `internal.vtu` 또는 ZIP을 업로드하면\n"
+                    "Upload `internal.vtu` or ZIP via **Data Input → Option C**\n"
                     "이 탭에서 실제 OpenFOAM 체적 결과가 표시됩니다."
                 )
                 # 업로드 숏컷
@@ -1645,7 +1679,7 @@ elif current_stage == "stage1":
                     type=["vtu", "vtm", "zip"], key="solid_shortcut_uploader",
                 )
                 if _solid_shortcut:
-                    with st.spinner("VTK 파싱 중..."):
+                    with st.spinner("Parsing VTK..."):
                         try:
                             _raw = _solid_shortcut.getvalue()
                             _ext = _solid_shortcut.name.lower().split(".")[-1]
