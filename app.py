@@ -1428,11 +1428,163 @@ elif current_stage == "stage1":
                     showlegend=True,
                 )
 
-            # flow_weight 컬럼 존재 = solver 실좌표 데이터 → Volume 렌더링 가능
+            # flow_weight 컬럼 존재 = solver 실좌표 데이터 → Cell Mesh 렌더링 가능
             _has_voxel_data = "flow_weight" in cae_df.columns
 
-            # Volume 렌더링용 다운샘플 한도 (브라우저 부담 방지)
-            _VOL_MAX_PTS = 8000
+            # ══ Cell Mesh 빌더 — CAE 포인트 → 채워진 사각형 셀 Mesh3d ══════
+            def _build_cell_mesh(df_in, field_col, max_pts=6000):
+                """
+                CAE 포인트 클라우드 → Moldflow 스타일 채워진 셀 메쉬.
+
+                전략:
+                  1) XY 격자 빈(bin)을 생성 (약 sqrt(N) × sqrt(N))
+                  2) 각 빈에 포인트가 있으면 셀 중앙에 값 배정 (IDW 평균)
+                  3) 인접 빈 4개씩 묶어 두 개의 삼각형(quad → 2 tris)으로 Mesh3d 구성
+                  4) 결과: 각 셀이 독립된 색상을 가진 채워진 패치
+
+                Returns: dict with keys x, y, z, i, j, k, intensity
+                """
+                _df = df_in.copy()
+                n = len(_df)
+                if n == 0:
+                    return None
+
+                # 다운샘플 (과다 포인트)
+                if n > max_pts:
+                    _step = max(1, n // max_pts)
+                    _df = _df.iloc[::_step].reset_index(drop=True)
+
+                x_arr = _df["x"].values.astype(float)
+                y_arr = _df["y"].values.astype(float)
+                z_arr = _df["z"].values.astype(float) if "z" in _df.columns else np.zeros(len(_df))
+                v_arr = _df[field_col].values.astype(float)
+
+                # 격자 크기 결정 (포인트 수의 제곱근 기준, 최소 20 × 20)
+                n_grid = max(20, int(np.sqrt(len(_df)) * 1.2))
+                n_grid = min(n_grid, 80)  # 최대 80×80 = 6400셀 (브라우저 부담)
+
+                x_bins = np.linspace(x_arr.min(), x_arr.max(), n_grid + 1)
+                y_bins = np.linspace(y_arr.min(), y_arr.max(), n_grid + 1)
+
+                # 각 포인트가 속하는 빈 인덱스
+                xi = np.digitize(x_arr, x_bins) - 1
+                yi = np.digitize(y_arr, y_bins) - 1
+                xi = np.clip(xi, 0, n_grid - 1)
+                yi = np.clip(yi, 0, n_grid - 1)
+
+                # 격자별 평균값 계산
+                cell_val = np.full((n_grid, n_grid), np.nan)
+                cell_z   = np.full((n_grid, n_grid), 0.0)
+                cell_cnt = np.zeros((n_grid, n_grid), dtype=int)
+
+                for idx in range(len(_df)):
+                    ii, jj = xi[idx], yi[idx]
+                    if np.isnan(cell_val[ii, jj]):
+                        cell_val[ii, jj] = v_arr[idx]
+                        cell_z[ii, jj]   = z_arr[idx]
+                    else:
+                        cell_val[ii, jj] += v_arr[idx]
+                        cell_z[ii, jj]   += z_arr[idx]
+                    cell_cnt[ii, jj] += 1
+
+                mask = cell_cnt > 0
+                cell_val[mask] /= cell_cnt[mask]
+                cell_z[mask]   /= cell_cnt[mask]
+
+                # 빈 셀 이웃 보간 (numpy only, 최대 4회 반복)
+                if (~mask).any() and mask.any():
+                    for _ in range(4):
+                        still_empty = np.isnan(cell_val)
+                        if not still_empty.any():
+                            break
+                        padded  = np.pad(cell_val, 1, constant_values=np.nan)
+                        zpadded = np.pad(cell_z,   1, constant_values=0.0)
+                        n_sum   = np.zeros((n_grid, n_grid))
+                        n_cnt   = np.zeros((n_grid, n_grid))
+                        zn_sum  = np.zeros((n_grid, n_grid))
+                        for di in range(3):
+                            for dj in range(3):
+                                if di == 1 and dj == 1:
+                                    continue
+                                sl  = padded [di:di+n_grid, dj:dj+n_grid]
+                                zsl = zpadded[di:di+n_grid, dj:dj+n_grid]
+                                valid = ~np.isnan(sl)
+                                n_sum  += np.where(valid, sl,  0)
+                                zn_sum += np.where(valid, zsl, 0)
+                                n_cnt  += valid.astype(float)
+                        fill_mask = still_empty & (n_cnt > 0)
+                        cell_val[fill_mask] = n_sum[fill_mask] / n_cnt[fill_mask]
+                        cell_z[fill_mask]   = zn_sum[fill_mask] / n_cnt[fill_mask]
+
+                # 셀 중앙 좌표 계산
+                x_centers = (x_bins[:-1] + x_bins[1:]) / 2  # (n_grid,)
+                y_centers = (y_bins[:-1] + y_bins[1:]) / 2  # (n_grid,)
+
+                # Mesh3d용 vertex / face 배열 구성
+                # vertex: 셀 코너 (n_grid+1) × (n_grid+1) 격자
+                # face: 각 셀 → 2 삼각형
+                nx1, ny1 = n_grid + 1, n_grid + 1
+                vert_x = np.repeat(x_bins, ny1)
+                vert_y = np.tile(y_bins, nx1)
+                vert_z = np.zeros(nx1 * ny1)
+
+                # 각 코너의 값: 해당 코너를 공유하는 셀 값의 평균
+                vert_val = np.full(nx1 * ny1, np.nan)
+                for ii in range(n_grid):
+                    for jj in range(n_grid):
+                        v = cell_val[ii, jj]
+                        if np.isnan(v):
+                            continue
+                        z_v = cell_z[ii, jj]
+                        corners = [
+                            ii * ny1 + jj,
+                            ii * ny1 + jj + 1,
+                            (ii + 1) * ny1 + jj,
+                            (ii + 1) * ny1 + jj + 1,
+                        ]
+                        for c in corners:
+                            if np.isnan(vert_val[c]):
+                                vert_val[c] = v
+                            else:
+                                vert_val[c] = (vert_val[c] + v) / 2
+                            # Z는 셀 중앙값 사용
+                            vert_z[c] = z_v
+
+                # NaN vertex 제거 (유효 셀 없는 코너)
+                valid_verts = ~np.isnan(vert_val)
+                vert_val = np.where(valid_verts, vert_val, np.nanmean(vert_val))
+
+                # Face 인덱스 생성 (유효 셀만)
+                tri_i, tri_j, tri_k = [], [], []
+                face_val = []  # face별 intensity (face center value)
+
+                for ii in range(n_grid):
+                    for jj in range(n_grid):
+                        v = cell_val[ii, jj]
+                        if np.isnan(v):
+                            continue
+                        # 4 corners
+                        c00 = ii * ny1 + jj
+                        c01 = ii * ny1 + jj + 1
+                        c10 = (ii + 1) * ny1 + jj
+                        c11 = (ii + 1) * ny1 + jj + 1
+                        # Tri 1: c00, c01, c10
+                        tri_i.append(c00); tri_j.append(c01); tri_k.append(c10)
+                        face_val.append(v)
+                        # Tri 2: c01, c11, c10
+                        tri_i.append(c01); tri_j.append(c11); tri_k.append(c10)
+                        face_val.append(v)
+
+                if not tri_i:
+                    return None
+
+                return {
+                    "x": vert_x, "y": vert_y, "z": vert_z,
+                    "i": np.array(tri_i), "j": np.array(tri_j), "k": np.array(tri_k),
+                    "intensity": vert_val,          # vertex-level (smooth shading)
+                    "facecolor": np.array(face_val), # face-level (flat, Moldflow style)
+                    "n_cells": len(tri_i) // 2,
+                }
 
             for i, ftab in enumerate(field_tabs):
                 ft = fields[i]
@@ -1443,55 +1595,48 @@ elif current_stage == "stage1":
 
                     fig3d = go.Figure()
 
-                    # ══ 분기 1: solver 실좌표 → Volume 렌더링 ═══════════════
+                    # ══ 분기 1: CAE 포인트 → Cell Mesh (Moldflow 스타일) ═════
                     if _has_voxel_data:
-                        # 다운샘플 (포인트 과다 시 균등 간격)
-                        _df = cae_df
-                        if len(_df) > _VOL_MAX_PTS:
-                            _step = max(1, len(_df) // _VOL_MAX_PTS)
-                            _df = _df.iloc[::_step].copy()
+                        cell_data = _build_cell_mesh(cae_df, ft, max_pts=6000)
 
-                        _vals = _df[ft].values.astype(float)
-                        _z_v  = _df["z"].values if has_z_global else np.zeros(len(_df))
+                        if cell_data is not None:
+                            # facecolor(face별 flat 색상)을 intensity로 사용하려면
+                            # vertex 수 = len(x), face intensity = facecolor
+                            # Plotly Mesh3d는 intensitymode="cell" 지원 (vertex count = n_faces)
+                            # → facecolor 배열은 face 수와 동일해야 함
+                            # → intensitymode="vertex" + vertex-level intensity 사용 (smooth)
+                            # → intensitymode="cell" + facecolor 배열 사용 (flat, Moldflow)
 
-                        # opacity scale: 값이 클수록 진하게 (fill_time은 반전)
-                        if ft == "fill_time":
-                            _op_vals = 1.0 - (_vals - _vals.min()) / max(_vals.ptp(), 1e-6)
+                            fig3d.add_trace(go.Mesh3d(
+                                x=cell_data["x"],
+                                y=cell_data["y"],
+                                z=cell_data["z"],
+                                i=cell_data["i"],
+                                j=cell_data["j"],
+                                k=cell_data["k"],
+                                intensity=cell_data["facecolor"],   # face당 하나의 값
+                                intensitymode="cell",               # ← Moldflow 스타일: 셀마다 독립 색상
+                                colorscale=colorscales[ft],
+                                colorbar=dict(
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                ),
+                                opacity=1.0,
+                                flatshading=True,                   # flat → 각 셀이 단색으로 채워짐
+                                lighting=dict(ambient=0.9, diffuse=0.3,
+                                              specular=0.0, roughness=1.0),
+                                name=f"{field_options[ft]} (Cell Mesh)",
+                                showlegend=True,
+                                hovertemplate=(
+                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
+                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm"
+                                    "<extra></extra>"
+                                ),
+                            ))
+                            _render_label = f"Cell Mesh ({cell_data['n_cells']:,} cells)"
                         else:
-                            _op_vals = (_vals - _vals.min()) / max(_vals.ptp(), 1e-6)
-                        _opscale = [
-                            [0.0, "rgba(0,0,0,0.0)"],
-                            [0.15, "rgba(0,0,0,0.05)"],
-                            [0.5,  "rgba(0,0,0,0.35)"],
-                            [1.0,  "rgba(0,0,0,0.90)"],
-                        ]
-
-                        fig3d.add_trace(go.Volume(
-                            x=_df["x"].values,
-                            y=_df["y"].values,
-                            z=_z_v,
-                            value=_vals,
-                            isomin=float(_vals.min()),
-                            isomax=float(_vals.max()),
-                            opacity=0.15,          # 전체 투명도 (내부 투시)
-                            surface_count=15,      # 등가면 수 — 많을수록 꽉 찬 느낌
-                            colorscale=colorscales[ft],
-                            colorbar=dict(
-                                title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                tickfont=dict(color="#e2e8f0"), x=1.02,
-                            ),
-                            caps=dict(
-                                x_show=True, y_show=True, z_show=True,
-                                x_fill=1, y_fill=1, z_fill=1,
-                            ),
-                            name=f"{field_options[ft]} (Volume)",
-                            showlegend=True,
-                            hovertemplate=(
-                                f"<b>{field_options[ft]}: %{{value:.2f}}</b><br>"
-                                "X: %{x:.2f} mm | Y: %{y:.2f} mm | Z: %{z:.2f} mm"
-                                "<extra></extra>"
-                            ),
-                        ))
+                            st.warning("셀 메쉬 생성 실패 — 데이터를 확인하세요.")
+                            _render_label = "Cell Mesh (error)"
 
                         # 유동선단 오버레이 (fill_time 탭)
                         if ft == "fill_time" and len(front_df) > 0:
@@ -1503,8 +1648,6 @@ elif current_stage == "stage1":
                                             line=dict(color="#ffffff", width=0.5)),
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
-
-                        _render_label = "Volume (Solid Voxel)"
 
                     # ══ 분기 2: STL 있으면 Mesh3d ════════════════════════════
                     elif stl_mesh_data is not None:
@@ -1555,44 +1698,58 @@ elif current_stage == "stage1":
 
                         _render_label = "Mesh3d — STL Surface"
 
-                    # ══ 분기 3: Scatter3d (fallback) ══════════════════════════
+                    # ══ 분기 3: CSV/샘플 데이터 → Cell Mesh fallback ════════
                     else:
-                        pt_color = cae_df[ft].values
-                        z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
+                        # STL 없이 CSV 데이터만 있어도 Cell Mesh 적용
+                        cell_data_fb = _build_cell_mesh(cae_df, ft, max_pts=5000)
 
-                        if ft == "pressure":
-                            pt_size = (4 + 8 * (1 - cae_df["rel_dist"].values)).clip(4, 12).tolist()
-                        else:
-                            pt_size = 7
-
-                        fig3d.add_trace(go.Scatter3d(
-                            x=cae_df["x"], y=cae_df["y"], z=z_col,
-                            mode="markers",
-                            marker=dict(
-                                size=pt_size,
-                                color=pt_color,
+                        if cell_data_fb is not None:
+                            fig3d.add_trace(go.Mesh3d(
+                                x=cell_data_fb["x"],
+                                y=cell_data_fb["y"],
+                                z=cell_data_fb["z"],
+                                i=cell_data_fb["i"],
+                                j=cell_data_fb["j"],
+                                k=cell_data_fb["k"],
+                                intensity=cell_data_fb["facecolor"],
+                                intensitymode="cell",
                                 colorscale=colorscales[ft],
                                 colorbar=dict(
                                     title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                     tickfont=dict(color="#e2e8f0"), x=1.02,
                                 ),
-                                opacity=0.85,
-                                line=dict(width=0),
-                            ),
-                            customdata=np.stack([
-                                cae_df[ft].values,
-                                cae_df["rel_dist"].values,
-                                cae_df["fill_time"].values,
-                            ], axis=-1),
-                            hovertemplate=(
-                                f"<b>{field_options[ft]}: %{{customdata[0]:.2f}}</b><br>"
-                                "X: %{x:.3f} mm | Y: %{y:.3f} mm<br>"
-                                "Gate Dist: %{customdata[1]:.0%}<br>"
-                                "Fill Time: %{customdata[2]:.2f} s<extra></extra>"
-                            ),
-                            name=f"{field_options[ft]} (Point Cloud)",
-                            showlegend=True,
-                        ))
+                                opacity=1.0,
+                                flatshading=True,
+                                lighting=dict(ambient=0.9, diffuse=0.3,
+                                              specular=0.0, roughness=1.0),
+                                name=f"{field_options[ft]} (Cell Mesh)",
+                                showlegend=True,
+                                hovertemplate=(
+                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
+                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm"
+                                    "<extra></extra>"
+                                ),
+                            ))
+                            _render_label = f"Cell Mesh ({cell_data_fb['n_cells']:,} cells)"
+                        else:
+                            # 최후 fallback — Scatter3d
+                            z_col = cae_df["z"].values if has_z_global else np.zeros(len(cae_df))
+                            fig3d.add_trace(go.Scatter3d(
+                                x=cae_df["x"], y=cae_df["y"], z=z_col,
+                                mode="markers",
+                                marker=dict(
+                                    size=7, color=cae_df[ft].values,
+                                    colorscale=colorscales[ft],
+                                    colorbar=dict(
+                                        title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
+                                        tickfont=dict(color="#e2e8f0"), x=1.02,
+                                    ),
+                                    opacity=0.85, line=dict(width=0),
+                                ),
+                                name=f"{field_options[ft]} (Point Cloud)",
+                                showlegend=True,
+                            ))
+                            _render_label = "Point Cloud"
 
                         if ft == "fill_time" and len(front_df) > 0:
                             fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
@@ -1603,9 +1760,6 @@ elif current_stage == "stage1":
                                             line=dict(color="#ffffff", width=1)),
                                 name="🟢 Flow Front (>85%)", showlegend=True,
                             ))
-
-                        st.info("💡 Signal ID로 시뮬레이션 결과를 로드하면 Volume 렌더링으로 전환됩니다.")
-                        _render_label = "Point Cloud"
 
                     # ── 게이트 마커 공통 ──────────────────────────────────
                     fig3d.add_trace(_gate_trace_3d(gate_z))
