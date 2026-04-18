@@ -1564,66 +1564,69 @@ elif current_stage == "stage1":
                     # ── 렌더링 모드 선택 ────────────────────────────────
                     render_mode = st.radio(
                         "🎨 렌더링 모드",
-                        ["🧱 Delaunay Solid (권장)", "🟦 Cell Mesh (Voxel)"],
+                        ["🟦 Cell Mesh (Voxel)", "🔵 Scatter Point Cloud (고밀도)"],
                         horizontal=True,
                         key=f"render_mode_{ft}",
-                        help="Delaunay Solid: 모든 압력/온도 데이터를 꽉 찬 덩어리로 렌더링 | Cell Mesh: 복셀 격자 방식",
+                        help="Cell Mesh(권장): 복셀 격자 방식 — 꽉 찬 솔리드, 멈춤 없음 | Scatter: 고밀도 포인트 클라우드",
                     )
-                    use_delaunay = render_mode.startswith("🧱")
+                    use_delaunay = render_mode.startswith("🔵")
 
                     if use_delaunay:
                         # ════════════════════════════════════════════════
-                        #  Delaunay alphahull 기반 Solid Field 렌더링
-                        #  · intensity=field_value → 압력/온도 전체 보존
-                        #  · alphahull: 점군 → 정밀 삼각 메쉬 자동 생성
-                        #  · STL 불필요 — 해석 데이터가 직접 형상을 만든다
+                        #  고밀도 Scatter3d 렌더링
+                        #  · Mesh3d alphahull 방식 완전 대체
+                        #  · 10,000~15,000pt 에서도 브라우저 멈춤 없음
+                        #  · 마커 크기를 키워 "꽉 찬 솔리드" 느낌 구현
                         # ════════════════════════════════════════════════
-                        dl_col1, dl_col2 = st.columns(2)
-                        with dl_col1:
-                            alphahull_val = st.slider(
-                                "Mesh 정밀도 (AlphaHull)", 
-                                min_value=-1, 
-                                max_value=10, 
-                                value=-1,  # 기본값을 -1(가장 빠름)로 설정해서 앱 멈춤 방지
-                                step=1,
-                                key=f"alphahull_{ft}",
-                                help="-1: 전체를 감싸는 껍질(가장 빠름), 0: 자동, 숫자가 작을수록(1, 2...) 데이터 윤곽에 더 밀착하지만 계산이 매우 무거워집니다."
+                        sc_col1, sc_col2 = st.columns(2)
+                        with sc_col1:
+                            scatter_n = st.slider(
+                                "포인트 수",
+                                min_value=3000,
+                                max_value=15000,
+                                value=10000,
+                                step=1000,
+                                key=f"scatter_n_{ft}",
+                                help="많을수록 정밀하지만 렌더링이 다소 느려집니다. 10,000이 최적입니다.",
                             )
-                        with dl_col2:
-                            dl_opacity = st.slider(
-                                "투명도", 0.3, 1.0, 1.0, 0.05,
-                                key=f"dl_opacity_{ft}",
-                                help="0.8 = 완전 불투명 Solid | 0.5~0.7 = 내부 투시",
+                        with sc_col2:
+                            scatter_size = st.slider(
+                                "마커 크기 (밀도감)",
+                                min_value=2,
+                                max_value=8,
+                                value=4,
+                                step=1,
+                                key=f"scatter_size_{ft}",
+                                help="크게 할수록 구멍이 줄고 솔리드처럼 보입니다. 4~5 권장.",
                             )
 
-                        # 포인트 수 제한 (25,000 — 데이터 손실 최소화)
-                        _dl_n = min(len(cae_df), 2000) # 25000에서 2000으로 하향
+                        _dl_n = min(len(cae_df), scatter_n)
                         vdf = cae_df.sample(_dl_n, random_state=42) if len(cae_df) > _dl_n else cae_df.copy()
                         _dl_z = vdf["z"].values if has_z_global else np.zeros(len(vdf))
 
-                        with st.spinner(f"🔄 Delaunay Solid 메쉬 생성 중 ({_dl_n:,}pts)..."):
-                            fig3d.add_trace(go.Mesh3d(
-                                x=vdf["x"].values,
-                                y=vdf["y"].values,
-                                z=_dl_z,
-                                intensity=vdf[ft].values,   # 압력/온도 데이터 전 정점에 매핑
-                                intensitymode="vertex",
+                        fig3d.add_trace(go.Scatter3d(
+                            x=vdf["x"].values,
+                            y=vdf["y"].values,
+                            z=_dl_z,
+                            mode="markers",
+                            marker=dict(
+                                size=scatter_size,
+                                color=vdf[ft].values,
                                 colorscale=colorscales[ft],
+                                opacity=1.0,
+                                line=dict(width=0),   # 테두리 제거 → 점들이 뭉쳐 매끄러워짐
                                 colorbar=dict(
                                     title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                     tickfont=dict(color="#e2e8f0"), x=1.02,
                                 ),
-                                opacity=dl_opacity,
-                                alphahull=alphahull_val,    # 점군 → 삼각 메쉬 자동 생성 핵심 파라미터
-                                flatshading=True,           # 해석 격자 면 분할 느낌 강조
-                                lighting=dict(ambient=0.85, diffuse=0.5, specular=0.1, roughness=0.8),
-                                name=f"{field_options[ft]} (Delaunay Solid)",
-                                showlegend=True,
-                                hovertemplate=(
-                                    f"<b>{field_options[ft]}: %{{intensity:.2f}}</b><br>"
-                                    "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
-                                ),
-                            ))
+                            ),
+                            name=f"{field_options[ft]} (Point Cloud)",
+                            showlegend=True,
+                            hovertemplate=(
+                                f"<b>{field_options[ft]}: %{{marker.color:.2f}}</b><br>"
+                                "X: %{x:.2f} mm | Y: %{y:.2f} mm<extra></extra>"
+                            ),
+                        ))
 
                         # STL 투명 윤곽선 오버레이 (형상 참고용)
                         if stl_mesh_data is not None:
@@ -1638,10 +1641,10 @@ elif current_stage == "stage1":
                             ))
 
                         st.caption(
-                            f"🧱 Delaunay Solid: **{_dl_n:,}pts** | alphahull={alphahull_val} | 투명도 {dl_opacity:.2f}"
+                            f"🔵 Point Cloud: **{_dl_n:,}pts** | 마커 크기 {scatter_size}"
                             + (" | +STL 윤곽선" if stl_mesh_data else "")
                         )
-                        _title_mode = f"Delaunay Solid (αhull={alphahull_val})"
+                        _title_mode = f"Point Cloud ({_dl_n:,}pts)"
 
                     else:
                         # ════════════════════════════════════════════════
