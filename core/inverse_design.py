@@ -1,8 +1,8 @@
 """
-Stage 3: Inverse Design Engine — 공차 기반 역설계
-목적: 예측 치수 편차를 공차 범위 내에서만 선형 보정 제안
-제약: 비선형/비대칭 보정 ❌ / 전체 scale 변경 ❌ / Linear correction only ✔
-수식: E(x) = L_target(x) - L_predicted(x)
+Stage 3: Inverse Design Engine — Tolerance-Based Mold Correction
+Purpose: Propose linear mold corrections only within tolerance range
+Constraints: No nonlinear/asymmetric correction / No global scale change / Linear correction only
+Formula: E(x) = L_target(x) - L_predicted(x)
 """
 
 import numpy as np
@@ -13,18 +13,18 @@ from typing import Optional
 
 @dataclass
 class CorrectionItem:
-    """보정 항목 1개"""
+    """Single correction item"""
     id: str                  # C-01, C-02 ...
     priority: str            # HIGH / MED / LOW
     correction_type: str     # uniform_offset / local_linear / feature_level / process
     feature_name: str
     error_mm: float          # E(x) = target - predicted
-    correction_mm: float     # 제안 보정량 (양수: 금형 크게, 음수: 작게)
-    mold_current: float      # 현재 금형 치수
-    mold_corrected: float    # 보정 후 금형 치수
+    correction_mm: float     # Suggested correction (positive: enlarge mold, negative: shrink)
+    mold_current: float      # Current mold dimension
+    mold_corrected: float    # Corrected mold dimension
     tolerance_plus: float
     tolerance_minus: float
-    within_tolerance: bool   # 보정 후 공차 내 들어오는지
+    within_tolerance: bool   # Whether correction brings part within tolerance
     note: str
 
 
@@ -33,26 +33,26 @@ def run_inverse_design(
     global_shrink_avg: float,
 ) -> dict:
     """
-    치수 예측 결과 DataFrame → 역설계 보정 제안 생성
+    Dimension prediction DataFrame -> Generate inverse design correction proposals
 
-    입력:
-      dim_df : predict_part_dimensions() 결과
-      global_shrink_avg : 전체 평균 수축률 (소수, 예: 0.0055)
+    Input:
+      dim_df : result from predict_part_dimensions()
+      global_shrink_avg : global average shrinkage rate (decimal, e.g. 0.0055)
     """
 
     corrections = []
     post_correction = []
     c_id = 1
 
-    # ── STEP 1: 전체 균일 보상 계산 ──────────────────
-    # 전체적으로 수축률 평균 기반 금형 scale-up
+    # ── STEP 1: Global Uniform Compensation ──────────────────
+    # Scale up mold globally based on average shrinkage rate
     uniform_comp_pct = global_shrink_avg * 100
 
     corrections.append(CorrectionItem(
         id=f"C-{c_id:02d}",
         priority="MED",
         correction_type="uniform_offset",
-        feature_name="전체 균일 수축 보상",
+        feature_name="Uniform Shrinkage Compensation",
         error_mm=0.0,
         correction_mm=0.0,
         mold_current=0.0,
@@ -60,15 +60,15 @@ def run_inverse_design(
         tolerance_plus=0.0,
         tolerance_minus=0.0,
         within_tolerance=True,
-        note=f"전체 금형 +{uniform_comp_pct:.3f}% 확대 (평균 수축률 보상)",
+        note=f"Enlarge entire mold by +{uniform_comp_pct:.3f}% (average shrinkage compensation)",
     ))
     c_id += 1
 
-    # ── STEP 2: Feature별 보정 ────────────────────────
+    # ── STEP 2: Feature-Level Correction ─────────────────────
     for _, row in dim_df.iterrows():
         verdict = row["판정"]
         if verdict == "OK" and row["공차 소진율 (%)"] < 60:
-            continue  # 여유 충분 → 보정 불필요
+            continue  # Sufficient margin -> no correction needed
 
         feature = row["Feature"]
         error = row["편차 (mm)"]            # predicted - nominal
@@ -85,13 +85,13 @@ def run_inverse_design(
         # E(x) = target - predicted = -error
         e_x = -error
 
-        # 보정 가능 여부: |E(x)| ≤ tolerance 범위 내에서만
-        max_allow = tol_p + tol_m  # 전체 공차 폭
-        correctable = abs(e_x) <= max_allow * 2.0  # 2배까지는 보정 시도
+        # Correctable only if |E(x)| is within tolerance range
+        max_allow = tol_p + tol_m  # Total tolerance band
+        correctable = abs(e_x) <= max_allow * 2.0  # Attempt correction up to 2x tolerance
 
         if not correctable:
             priority = "HIGH"
-            note = "공차 초과 범위가 너무 큼 — 형상 재설계 필요"
+            note = "Deviation too large — geometry redesign required"
             within_tol = False
         elif verdict in ("UNDER", "OVER"):
             priority = "HIGH"
@@ -99,11 +99,11 @@ def run_inverse_design(
             within_tol = True
         else:
             priority = "MED"
-            note = f"공차 소진율 {row['공차 소진율 (%)']}% — 선제 보정 권장"
+            note = f"Tolerance consumed {row['공차 소진율 (%)']:.1f}% — preventive correction recommended"
             within_tol = True
 
-        # 금형 보정 치수: 수축률 역산
-        # L_mold_new = L_nominal / (1 - S)  ← 정방향 역산
+        # Corrected mold dimension via inverse shrinkage calculation
+        # L_mold_new = L_nominal / (1 - S)
         nominal = row["도면 공칭 (mm)"]
         if nominal > 0 and (1 - shrinkage) > 0:
             mold_corrected = nominal / (1 - shrinkage)
@@ -128,23 +128,23 @@ def run_inverse_design(
         ))
         c_id += 1
 
-        # 보정 후 예측 결과
+        # Post-correction prediction result
         new_predicted = mold_corrected * (1 - shrinkage)
         new_error = new_predicted - nominal
         new_verdict = (
             "OK" if abs(new_error) <= min(tol_p, tol_m) * 0.95
-            else ("주의" if abs(new_error) <= max(tol_p, tol_m) else "초과")
+            else ("CAUTION" if abs(new_error) <= max(tol_p, tol_m) else "EXCEED")
         )
         post_correction.append({
             "Feature": feature,
-            "보정 전 편차": round(error, 4),
-            "보정 후 편차": round(new_error, 4),
-            "공차": f"+{tol_p} / -{tol_m}",
-            "결과": new_verdict,
+            "Pre-Dev.": round(error, 4),
+            "Post-Dev.": round(new_error, 4),
+            "Tolerance": f"+{tol_p} / -{tol_m}",
+            "Result": new_verdict,
         })
 
-    # ── STEP 3: 공정 파라미터 보정 (금형 미수정 대안) ──
-    # 보압 증가 → 수축률 감소 효과
+    # ── STEP 3: Process Parameter Correction (alternative to mold rework) ──
+    # Increasing packing pressure reduces shrinkage
     residual_items = [c for c in corrections if c.correction_type == "local_linear"
                       and not c.within_tolerance]
     if residual_items:
@@ -152,7 +152,7 @@ def run_inverse_design(
             id=f"C-{c_id:02d}",
             priority="LOW",
             correction_type="process",
-            feature_name="보압 (Packing Pressure) 조정",
+            feature_name="Packing Pressure Adjustment",
             error_mm=0.0,
             correction_mm=0.0,
             mold_current=0.0,
@@ -160,10 +160,10 @@ def run_inverse_design(
             tolerance_plus=0.0,
             tolerance_minus=0.0,
             within_tolerance=True,
-            note="보압 +5~10 MPa 증가 시 수축률 약 0.05~0.1% 감소 효과 (금형 미수정 대안)",
+            note="+5~10 MPa packing pressure increase reduces shrinkage by ~0.05~0.1% (alternative to mold rework)",
         ))
 
-    # ── 비용 절감 추정 ────────────────────────────────
+    # ── Cost Reduction Estimate ───────────────────────────────
     high_count = sum(1 for c in corrections if c.priority == "HIGH")
     trial_before = min(3 + high_count, 6)
     trial_after = max(1, trial_before - 2)
@@ -185,8 +185,8 @@ def run_inverse_design(
 
 
 def _make_correction_note(feature: str, error: float, verdict: str) -> str:
-    direction = "금형 확대" if error > 0 else "금형 축소"
-    return f"{feature}: {direction} {abs(error):.4f}mm 필요 ({verdict} 보정)"
+    direction = "Enlarge mold" if error > 0 else "Reduce mold"
+    return f"{feature}: {direction} by {abs(error):.4f}mm ({verdict} correction)"
 
 
 def _make_summary(corrections: list) -> dict:
@@ -200,16 +200,16 @@ def _make_summary(corrections: list) -> dict:
         "LOW": low,
         "total_correctable": total_correct,
         "verdict": (
-            "✅ 전체 공차 내 보정 가능" if high == 0
-            else f"⚠ {high}개 항목 우선 보정 필요"
+            "✅ All corrections within tolerance" if high == 0
+            else f"⚠ {high} item(s) require priority correction"
         ),
     }
 
 
 def build_error_map(shrink_df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
     """
-    E(x) map 생성 — 위치별 오차 분포 (heatmap용)
-    shrink_df: 위치별 수축률 포함
+    Generate E(x) map — positional error distribution (for heatmap)
+    shrink_df: contains position-wise shrinkage data
     """
     if "x" not in shrink_df.columns:
         return {}
@@ -218,9 +218,9 @@ def build_error_map(shrink_df: pd.DataFrame, features_df: pd.DataFrame) -> dict:
     y = shrink_df["y"].values
     s = shrink_df["shrinkage"].values
 
-    # 단순화: 오차 = 위치별 수축률과 평균의 차이 (실제는 도면 대비)
+    # Simplified: error = deviation of local shrinkage from mean (vs. drawing in real use)
     s_mean = s.mean()
-    error = (s - s_mean) * 100  # % 단위 편차
+    error = (s - s_mean) * 100  # deviation in %
 
     return {
         "x": x.round(2).tolist(),
