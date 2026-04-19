@@ -1564,10 +1564,10 @@ elif current_stage == "stage1":
                     # ── Render mode selection ────────────────────────────────
                     render_mode = st.radio(
                         "🎨 Render Mode",
-                        ["🟦 Cell Mesh (Voxel)", "🔵 Scatter Point Cloud (High-density)"],
+                        ["🔵 Scatter Point Cloud (High-density)", "🟦 Cell Mesh (Voxel)"],
                         horizontal=True,
                         key=f"render_mode_{ft}",
-                        help="Cell Mesh (recommended): voxel grid — solid fill, no freeze | Scatter: high-density point cloud",
+                        help="Scatter: high-density point cloud (default) | Cell Mesh: voxel grid — solid fill, no freeze",
                     )
                     use_delaunay = render_mode.startswith("🔵")
 
@@ -1616,8 +1616,9 @@ elif current_stage == "stage1":
                                 opacity=1.0,
                                 line=dict(width=0),   # remove border → points merge smoothly
                                 colorbar=dict(
-                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0", size=10)),
+                                    tickfont=dict(color="#e2e8f0", size=9),
+                                    thickness=12, len=0.75, x=1.02, xpad=4,
                                 ),
                             ),
                             name=f"{field_options[ft]} (Point Cloud)",
@@ -1663,8 +1664,9 @@ elif current_stage == "stage1":
                                 intensity=cell_data["facecolor"], intensitymode="cell",
                                 colorscale=colorscales[ft],
                                 colorbar=dict(
-                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
-                                    tickfont=dict(color="#e2e8f0"), x=1.02,
+                                    title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0", size=10)),
+                                    tickfont=dict(color="#e2e8f0", size=9),
+                                    thickness=12, len=0.75, x=1.02, xpad=4,
                                 ),
                                 opacity=1.0, flatshading=True,
                                 lighting=dict(ambient=0.9, diffuse=0.3, specular=0.0, roughness=1.0),
