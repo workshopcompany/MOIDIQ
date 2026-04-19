@@ -17,12 +17,12 @@ import requests
 
 
 # ══════════════════════════════════════════════════════════
-#  VTK/VTU 파서 — pyvista 없이 stdlib만 사용
-#  지원 형식:
-#   A) ASCII VTU (format="ascii")  ← 이전 OpenFOAM 결과
-#   B) Appended+Base64+ZLib VTU    ← MIM-Ops GitHub Actions 결과
-#   C) 위 파일이 담긴 ZIP
-#  NumPy 2.0 완전 호환 (ptp() 미사용)
+#  VTK/VTU Parser — uses only stdlib without pyvista
+#  Supported formats:
+#   A) ASCII VTU (format="ascii")  ← legacy OpenFOAM output
+#   B) Appended+Base64+ZLib VTU    ← MIM-Ops GitHub Actions output
+#   C) ZIP containing the above files
+#  NumPy 2.0 fully compatible (no ptp())
 # ══════════════════════════════════════════════════════════
 
 _VTK_DTYPE = {
@@ -34,10 +34,10 @@ _VTK_DTYPE = {
 }
 
 def _vtk_clean_xml(text: str) -> str:
-    """싱글/더블 쿼트 xmlns 속성 모두 제거 (ET 파싱 전처리)."""
+    """Remove all single/double-quote xmlns attributes (ET pre-processing)."""
     return re.sub(r""" xmlns(?::[a-zA-Z0-9_]+)?=['\"][^'\"]*['\"]""", "", text)
 
-# ── A) ASCII DataArray 파서 ───────────────────────────────
+# ── A) ASCII DataArray Parser ───────────────────────────────
 def _read_dataarray_ascii(node: ET.Element) -> np.ndarray:
     """ASCII format DataArray → float64 ndarray."""
     text_data = (node.text or "").strip()
@@ -48,20 +48,20 @@ def _read_dataarray_ascii(node: ET.Element) -> np.ndarray:
     except ValueError:
         return np.array([], dtype=np.float64)
 
-# ── B) Appended+Base64+ZLib 파서 ─────────────────────────
+# ── B) Appended+Base64+ZLib Parser ─────────────────────────
 def _parse_appended_block(b64_stream: bytes, char_offset: int,
                           header_type: str = "UInt32") -> bytes:
     """
-    VTK appended base64+zlib 블록을 압축 해제해 raw bytes 반환.
+    Decompress VTK appended base64+zlib block and return raw bytes.
     
-    [수정됨] 
-    1. Base64 인코딩 시 발생하는 줄바꿈(\n) 및 공백 제거 로직 추가 (길이 계산 오류 방지)
-    2. 블록 0 (헤더/데이터 병합) 패턴과 블록 1/2 (헤더/데이터 분리) 패턴을 동적으로 감지하여 파싱
+    [Updated] 
+    1. Strip newlines(\n) and spaces from Base64 stream to prevent length calculation errors
+    2. Dynamically detect Block-0 (merged header/data) vs Block-1/2 (split) patterns for parsing
     """
     hsz  = 4 if header_type == "UInt32" else 8
     hfmt = "<I" if header_type == "UInt32" else "<Q"
 
-    # 1. 헤더 크기를 파악하기 위해 안전하게 맨 앞부분 일부만 디코딩 (줄바꿈 무시)
+    # 1. Decode only the first few chars to determine header size (ignoring newlines)
     temp_chunk = b64_stream[char_offset:char_offset + 100].translate(None, b" \n\r\t")
     pad_temp = (4 - len(temp_chunk) % 4) % 4
     temp_dec = base64.b64decode(temp_chunk + b"=" * pad_temp)
@@ -69,10 +69,10 @@ def _parse_appended_block(b64_stream: bytes, char_offset: int,
     n_blocks = struct.unpack_from(hfmt, temp_dec, 0)[0]
     hbytes = (3 + n_blocks) * hsz
     
-    # 헤더만 단독으로 인코딩되었을 때 패딩을 포함한 Base64 길이
+    # Base64 length of header alone including padding
     header_b64_chars = ((hbytes + 2) // 3) * 4  
 
-    # 2. 헤더의 comp_sizes 전체를 파싱하기 위해 정확한 길이만큼 다시 디코딩
+    # 2. Re-decode the exact length needed to parse all comp_sizes from header
     hdr_chunk = b64_stream[char_offset:char_offset + header_b64_chars + 100].translate(None, b" \n\r\t")[:header_b64_chars]
     hdr_pad = (4 - len(hdr_chunk) % 4) % 4
     hdr_raw = base64.b64decode(hdr_chunk + b"=" * hdr_pad)
@@ -80,32 +80,32 @@ def _parse_appended_block(b64_stream: bytes, char_offset: int,
     comp_sizes = [struct.unpack_from(hfmt, hdr_raw, (3 + i) * hsz)[0]
                   for i in range(n_blocks)]
     total_comp = sum(comp_sizes)
-    data_b64_chars = ((total_comp + 2) // 3) * 4 # 압축 데이터의 Base64 길이
+    data_b64_chars = ((total_comp + 2) // 3) * 4 # Base64 length of compressed data
 
-    # 3. 전체 필요한 유효 Base64 문자 수(헤더 + 데이터)만큼 넉넉하게 추출
+    # 3. Extract generously enough valid Base64 chars (header + data)
     total_b64_chars_needed = header_b64_chars + data_b64_chars
     extract_len = int(total_b64_chars_needed * 1.5) + 100 
     clean_stream = b64_stream[char_offset:char_offset + extract_len].translate(None, b" \n\r\t")
     
-    # 만약 여유를 줬는데도 띄어쓰기/줄바꿈이 너무 많아 유효 문자가 부족하다면 연장
+    # Extend if too many whitespace/newlines cause insufficient valid chars
     while len(clean_stream) < total_b64_chars_needed and extract_len < len(b64_stream) - char_offset:
         extract_len += data_b64_chars
         clean_stream = b64_stream[char_offset:char_offset + extract_len].translate(None, b" \n\r\t")
 
-    # 4. 분석된 VTK 블록 분리 구조(==)에 따른 동적 파싱 로직
-    # 헤더 영역의 Base64 문자열 내에 패딩(=)이 포함되어 있다면 헤더와 데이터가 쪼개진 것
+    # 4. Dynamic parsing logic based on detected VTK block split structure (==)
+    # If padding (=) is found within the header Base64 region, header and data are split
     if b"=" in clean_stream[:header_b64_chars]:
-        # [블록 1, 2 패턴 (분리형)] 
-        # 중간에 낀 패딩 마커(=)를 모두 지우고, 순수 데이터 Base64 문자만 도출
+        # [Block 1, 2 pattern (split type)] 
+        # Remove all mid-stream padding markers (=) and extract pure data Base64 chars
         clean_stream_no_pad = clean_stream.replace(b"=", b"")
-        h_chars_no_pad = (hbytes * 4 + 2) // 3  # 패딩을 제외한 헤더 Base64 길이
+        h_chars_no_pad = (hbytes * 4 + 2) // 3  # Header Base64 length excluding padding
         
         data_chunk = clean_stream_no_pad[h_chars_no_pad : h_chars_no_pad + data_b64_chars]
         pad = (4 - len(data_chunk) % 4) % 4
         data_bytes = base64.b64decode(data_chunk + b"=" * pad)
     else:
-        # [블록 0 패턴 (병합형)]
-        # 전체를 통째로 디코딩한 뒤 바이트 단위에서 헤더(hbytes) 이후를 잘라냄
+        # [Block 0 pattern (merged type)]
+        # Decode the whole chunk at once and slice off the header (hbytes) bytes
         merged_chunk_len = ((hbytes + total_comp + 2) // 3) * 4
         merged_chunk = clean_stream[:merged_chunk_len]
         pad = (4 - len(merged_chunk) % 4) % 4
@@ -113,7 +113,7 @@ def _parse_appended_block(b64_stream: bytes, char_offset: int,
         
         data_bytes = merged_raw[hbytes:]
 
-    # 5. zlib 해제
+    # 5. zlib decompress
     pos, out = 0, b""
     for cs in comp_sizes:
         out += zlib.decompress(data_bytes[pos:pos + cs])
@@ -127,14 +127,14 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
     """Appended+Base64+ZLib VTU → DataFrame."""
     text = raw_bytes.decode("utf-8", errors="replace")
 
-    # AppendedData 스트림 추출
+    # Extract AppendedData stream
     app_start  = raw_bytes.find(b"<AppendedData")
     section    = raw_bytes[app_start:]
     underscore = section.find(b"_")
     end_tag    = section.find(b"<", underscore)
     b64_stream = section[underscore + 1:end_tag].strip()
 
-    # header_type / mesh 크기
+    # header_type / mesh size
     ht_m   = re.search(r'header_type=["\'](\w+)["\']', text)
     htype  = ht_m.group(1) if ht_m else "UInt32"
     npts_m = re.search(r'NumberOfPoints=["\'](\d+)["\']', text)
@@ -145,7 +145,7 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
     dtmap = {"Float32": "<f4", "Float64": "<f8",
              "Int64": "<i8", "Int32": "<i4", "UInt8": "u1"}
 
-    # DataArray 메타데이터 수집
+    # Collect DataArray metadata
     das = {}
     for m in re.finditer(r"<DataArray([^/]+?)/?>\s*", text):
         tag = m.group(1)
@@ -160,11 +160,11 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
                 "nc":     int(nc.group(1)) if nc else 1,
             }
 
-    # 각 DataArray 해제
+    # Decompress each DataArray
     arrays = {}
     for name, info in das.items():
         if name in ("connectivity", "offsets", "types"):
-            continue  # 위상 데이터는 시각화 불필요
+            continue  # topology data — not needed for visualization
         try:
             raw_out = _parse_appended_block(b64_stream, info["offset"], htype)
             dtype   = dtmap.get(info["type"], "<f4")
@@ -181,21 +181,21 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
         except Exception:
             pass
 
-    # 좌표 처리
+    # Coordinate processing
     pts = arrays.pop("_pts", None)
     if pts is None:
-        raise ValueError("VTU: Points 데이터를 파싱할 수 없습니다.")
+        raise ValueError("VTU: Failed to parse Points data.")
 
-    # CellData vs PointData 판별 및 매핑
+    # Detect CellData vs PointData and map accordingly
     # pts: (n_pts, 3), celldata: (n_cells,)
-    # pts_per_cell = n_pts / n_cells (정수배인 경우 셀 중심점 계산)
+    # pts_per_cell = n_pts / n_cells (compute cell centroids when integer multiple)
     result = {}
     pts_per_cell = round(n_pts / n_cells) if n_cells > 0 else 1
     use_cells = (n_cells > 0 and pts_per_cell >= 1
                  and abs(pts_per_cell * n_cells - n_pts) < n_cells)
 
     if use_cells:
-        # 셀 중심점 (포인트를 셀 단위로 그룹화)
+        # Cell centroids (group points by cell)
         n_use      = n_cells * pts_per_cell
         centroids  = pts[:n_use].reshape(n_cells, pts_per_cell, 3).mean(axis=1)
         result.update({"x": centroids[:, 0],
@@ -213,12 +213,12 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
 
     df = pd.DataFrame(result)
 
-    # ── 단위 변환 ──────────────────────────────────────────
-    # flow_distance [0=gate, 1=end] → 압력·충진시간·온도 근사
+    # ── Unit conversion ──────────────────────────────────────────
+    # flow_distance [0=gate, 1=end] → approximate pressure/fill_time/temperature
     if "flow_distance" in df.columns:
         fd = df["flow_distance"].to_numpy(float)
         if "pressure" not in df.columns:
-            df["pressure"]    = np.clip((1.0 - fd) * 3.0, 0.0, None)  # gate 최대압
+            df["pressure"]    = np.clip((1.0 - fd) * 3.0, 0.0, None)  # max pressure at gate
         if "fill_time" not in df.columns:
             df["fill_time"]   = fd
         if "temperature" not in df.columns:
@@ -241,7 +241,7 @@ def _parse_vtu_appended(raw_bytes: bytes, material: str,
     return df
 
 
-# ── A) ASCII VTU 파서 ────────────────────────────────────
+# ── A) ASCII VTU Parser ────────────────────────────────────
 def _parse_vtu_ascii(raw_bytes: bytes, material: str,
                       rho: float) -> pd.DataFrame:
     """ASCII format VTU → DataFrame."""
@@ -249,22 +249,22 @@ def _parse_vtu_ascii(raw_bytes: bytes, material: str,
     try:
         root = ET.fromstring(text)
     except ET.ParseError as e:
-        raise ValueError(f"VTU XML 파싱 실패: {e}")
+        raise ValueError(f"VTU XML parse failed: {e}")
 
     piece = root.find(".//Piece")
     if piece is None:
-        raise ValueError("VTU: <Piece> 태그 없음")
+        raise ValueError("VTU: <Piece> tag not found")
     n_pts = int(piece.attrib.get("NumberOfPoints", 0))
     if n_pts == 0:
         raise ValueError("VTU: NumberOfPoints=0")
 
     pts_node = piece.find(".//Points/DataArray")
     if pts_node is None:
-        raise ValueError("VTU: Points/DataArray 없음")
+        raise ValueError("VTU: Points/DataArray not found")
     pts_flat = _read_dataarray_ascii(pts_node)
     if len(pts_flat) < n_pts * 3:
         raise ValueError(
-            f"VTU: 좌표 데이터 부족 ({len(pts_flat)} < {n_pts * 3})")
+            f"VTU: Insufficient coordinate data ({len(pts_flat)} < {n_pts * 3})")
     coords = pts_flat[:n_pts * 3].reshape(-1, 3)
     result: dict = {
         "x": coords[:, 0].astype(float),
@@ -321,41 +321,41 @@ def _parse_vtu_ascii(raw_bytes: bytes, material: str,
     return df
 
 
-# ── 통합 파서 (외부에서 호출하는 메인 함수) ──────────────
+# ── Unified parser (main entry point) ──────────────────────
 def parse_vtu_to_dataframe(file_bytes: bytes, material: str = "17-4PH",
                             rho: float = 7780.0) -> pd.DataFrame:
     """
-    VTU 파일 자동 감지 파서.
-    - Appended+Base64+ZLib (MIM-Ops GitHub Actions 출력) → _parse_vtu_appended
-    - ASCII format (foamToVTK -ascii 출력)               → _parse_vtu_ascii
+    Auto-detecting VTU file parser.
+    - Appended+Base64+ZLib (MIM-Ops GitHub Actions output) → _parse_vtu_appended
+    - ASCII format (foamToVTK -ascii output)               → _parse_vtu_ascii
     """
-    # Appended 방식 감지
+    # Detect Appended mode
     if b"AppendedData" in file_bytes:
         try:
             return _parse_vtu_appended(file_bytes, material=material, rho=rho)
         except Exception as e:
-            raise ValueError(f"VTU(Appended) 파싱 실패: {e}")
+            raise ValueError(f"VTU(Appended) parse failed: {e}")
     else:
         try:
             return _parse_vtu_ascii(file_bytes, material=material, rho=rho)
         except Exception as e:
-            raise ValueError(f"VTU(ASCII) 파싱 실패: {e}")
+            raise ValueError(f"VTU(ASCII) parse failed: {e}")
 
 
 def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
                                 rho: float = 7780.0) -> pd.DataFrame:
     """
-    ZIP 파일 → VTU 파싱.
-    우선순위: .vtm DataSet 참조 → 'internal' 포함 .vtu → 가장 큰 .vtu
+    ZIP file → VTU parsing.
+    Priority: .vtm DataSet reference → .vtu containing 'internal' → largest .vtu
     """
     buf = io.BytesIO(zip_bytes)
     if not zipfile.is_zipfile(buf):
-        raise ValueError("유효한 ZIP 파일이 아닙니다.")
+        raise ValueError("Not a valid ZIP file.")
 
     with zipfile.ZipFile(buf) as z:
         names = z.namelist()
 
-        # 전략 1: .vtm → DataSet file= 추적
+        # Strategy 1: .vtm → trace DataSet file=
         vtu_candidate = None
         for vtm_path in [n for n in names if n.lower().endswith(".vtm")]:
             try:
@@ -374,20 +374,20 @@ def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
             if vtu_candidate:
                 break
 
-        # 전략 2: internal 포함 .vtu
+        # Strategy 2: .vtu containing "internal"
         all_vtu = [n for n in names if n.lower().endswith(".vtu")]
         if not vtu_candidate:
             internals = [n for n in all_vtu if "internal" in n.lower()]
             vtu_candidate = sorted(internals)[-1] if internals else None
 
-        # 전략 3: 가장 큰 .vtu
+        # Strategy 3: largest .vtu
         if not vtu_candidate and all_vtu:
             vtu_candidate = max(all_vtu, key=lambda n: z.getinfo(n).file_size)
 
         if not vtu_candidate:
             raise FileNotFoundError(
-                "ZIP 내에 .vtu 파일이 없습니다.\n"
-                "foamToVTK 실행 후 VTK/ 폴더를 ZIP 압축해 업로드하세요.")
+                "No .vtu files found in ZIP.\n"
+                "Run foamToVTK first, then ZIP the VTK/ folder and upload.")
 
         vtu_bytes = z.read(vtu_candidate)
 
@@ -398,14 +398,14 @@ def parse_vtk_zip_to_dataframe(zip_bytes: bytes, material: str = "17-4PH",
     except ValueError as e:
         raise ValueError(
             f"{os.path.basename(vtu_candidate)}: {e}\n\n"
-            "📌 해결: internal.vtu 파일만 단독으로 업로드해 보세요.")
+            "📌 Tip: Try uploading the internal.vtu file alone.")
 
-# ── 경로 설정 ──────────────────────────────────────────────
+# ── Path configuration ──────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# ── 페이지 설정 (가장 먼저) ───────────────────────────────
+# ── Page configuration (must be first) ───────────────────────────────
 st.set_page_config(
     page_title="MOLDIQ — Smart MIM Design System",
     page_icon="🔩",
@@ -413,7 +413,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 모듈 임포트 ───────────────────────────────────────────
+# ── Module imports ───────────────────────────────────────────
 try:
     from core.i18n import TRANSLATIONS
     from core.rule_check import run_feasibility_check, MATERIAL_LIMITS
@@ -470,7 +470,7 @@ html, body, [class*="css"] { font-family: 'Noto Sans KR', sans-serif; }
 """, unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════
-#  Session State 초기화
+#  Session State Initialization
 # ══════════════════════════════════════════════════════════
 def init_state():
     defaults = {
@@ -481,16 +481,16 @@ def init_state():
         "shrink_df": None, "dim_df": None,
         "inverse_result": None,
         "material": "PC+ABS", "avg_thickness": 2.4,
-        # Mold Concept → Feasibility 연동 데이터
+        # Mold Concept → Feasibility linked data
         "stl_analysis": {
             "file_loaded": False, "geometry": None,
             "undercuts": None, "parting": None,
             "design": None, "pull_direction": "Z"
         },
-        # Stage 1 GitHub 연동
+        # Stage 1 GitHub integration
         "github_sim_signal_id": None,
         "flow_csv_ready": False,
-        # [FIX-2] Mold Concept에서 업로드한 STL 전역 유지
+        # [FIX-2] Persist STL uploaded from Mold Concept globally
         "stl_bytes": None,
         "stl_name": None,
         "uploaded_stl_path": None,
@@ -502,10 +502,10 @@ def init_state():
 init_state()
 
 # ══════════════════════════════════════════════════════════
-#  사이드바
+#  Sidebar
 # ══════════════════════════════════════════════════════════
 with st.sidebar:
-    # 언어 설정
+    # Language setting
     st.markdown("### 🌐 Language Settings")
     lang = st.selectbox("Select Language",
         ["English", "한국어", "Español", "日本語", "中文", "Français", "हिन्दी"],
@@ -517,7 +517,7 @@ with st.sidebar:
                 unsafe_allow_html=True)
     st.divider()
 
-    # 워크플로우 단계 선택
+    # Workflow stage selection
     stage_labels = {
         "🎯 Mold Concept (Main)": "mold_concept",
         T["stage0_label"]: "stage0",
@@ -530,7 +530,7 @@ with st.sidebar:
 
     st.divider()
 
-    # 전역 설정
+    # Global settings
     st.markdown(f"#### {T['global_settings']}")
     material = st.selectbox(T["material"], list(MATERIAL_LIMITS.keys()), index=0, key="material_select")
     st.session_state["material"] = material
@@ -539,7 +539,7 @@ with st.sidebar:
 
     st.divider()
 
-    # 진행 상태
+    # Progress status
     st.markdown(f"#### {T['status']}")
     for label, done_key in [
         (T["stage0_label"], "stage0_done"),
@@ -552,7 +552,7 @@ with st.sidebar:
 
     st.divider()
 
-    # ML 피드백
+    # ML feedback
     st.markdown(f"### {T['ml_feedback']}")
     real_csv = st.file_uploader(T["upload_actual"], type=["csv"])
     if real_csv and st.button(T.get("btn_retrain", "Retrain XGBoost Model")):
@@ -562,30 +562,30 @@ with st.sidebar:
         else:
             st.warning(T.get("warn_run_st2_first", "Please run Stage 2 first."))
 
-# ── 언어 객체 (사이드바 밖에서도 사용) ───────────────────
+# ── Language object (also used outside sidebar) ───────────────────
 T = TRANSLATIONS.get(st.session_state.get("lang_select", "English"), TRANSLATIONS["English"])
 
 # ══════════════════════════════════════════════════════════
-#  공통 유틸
+#  Common Utilities
 # ══════════════════════════════════════════════════════════
 def verdict_color(v):
     if v in ("PASS", "OK"): return "🟢"
     if v in ("WARN", "Attention"): return "🟡"
     return "🔴"
 
-def style_verdict_df(df, verdict_col="판정"):
+def style_verdict_df(df, verdict_col="Verdict"):
     def color_row(row):
         v = row.get(verdict_col, "")
         if v in ("PASS", "OK"): return ["background-color: rgba(0,212,170,0.08)"] * len(row)
-        if v in ("WARN", "주의", "OVER", "UNDER"): return ["background-color: rgba(255,107,53,0.08)"] * len(row)
+        if v in ("WARN", "Attention", "OVER", "UNDER"): return ["background-color: rgba(255,107,53,0.08)"] * len(row)
         if v == "FAIL": return ["background-color: rgba(255,59,92,0.08)"] * len(row)
         return [""] * len(row)
     return df.style.apply(color_row, axis=1)
 
 
-# ── [FIX] GitHub 연결 상태 확인 / 안내 헬퍼 ─────────────────
+# ── [FIX] GitHub connection check / guide helper ─────────────────
 def _check_github_secrets() -> bool:
-    """Streamlit secrets에 GITHUB_TOKEN이 유효하게 설정됐는지 확인."""
+    """Check if GITHUB_TOKEN is validly configured in Streamlit secrets."""
     try:
         token = st.secrets["GITHUB_TOKEN"]
         return bool(token and str(token).strip() and str(token) != "ghp_xxxxxxxxxxxx")
@@ -594,13 +594,13 @@ def _check_github_secrets() -> bool:
 
 
 def _show_github_token_guide():
-    """GitHub Token 미설정 시 단계별 안내 UI 표시."""
+    """Display step-by-step guide UI when GitHub Token is not configured."""
     st.error("🔑 **GITHUB_TOKEN is not configured.**")
-    with st.expander("📋 설정 방법 — 클릭해서 펼치기", expanded=True):
+    with st.expander("📋 Setup Guide — Click to expand", expanded=True):
         st.markdown("""
-**Streamlit Cloud를 사용하는 경우:**
-1. [share.streamlit.io](https://share.streamlit.io) → 앱 → ⋯ 메뉴 → **Edit secrets**
-2. 아래 내용을 붙여넣고 토큰값만 교체:
+**If using Streamlit Cloud:**
+1. [share.streamlit.io](https://share.streamlit.io) → App → ⋯ menu → **Edit secrets**
+2. Paste the following and replace only the token value:
 
 ```toml
 GITHUB_TOKEN        = "ghp_YOUR_TOKEN_HERE"
@@ -608,20 +608,20 @@ OPENFOAM_REPO_OWNER = "workshopcompany"
 OPENFOAM_REPO_NAME  = "OpenFOAM-Injection-Automation"
 ```
 
-**로컬 실행의 경우:**
-프로젝트 루트 `.streamlit/secrets.toml` 파일을 위 내용으로 생성.
+**If running locally:**
+Create a `.streamlit/secrets.toml` file in the project root with the content above.
 
-**GitHub Token 발급:**
+**How to generate a GitHub Token:**
 GitHub → Settings → Developer settings → Personal access tokens → Generate new token (classic)
-→ `repo` 권한 체크 → 생성된 토큰 복사
+→ Check `repo` scope → Copy the generated token
 
 ---
-💡 **GitHub 없이 바로 사용:** 아래 **Option C** (VTK 파일 직접 업로드)로 결과를 로드하세요.
+💡 **Use without GitHub:** Load results via **Option C** below (direct VTK file upload).
         """)
 
 
 # ══════════════════════════════════════════════════════════
-#  PHASE: Mold Concept (기본 페이지 — STL 분석)
+#  PHASE: Mold Concept (Main Page — STL Analysis)
 # ══════════════════════════════════════════════════════════
 if current_stage == "mold_concept":
     st.markdown('<div class="stage-tag">STAGE 0</div>', unsafe_allow_html=True)
@@ -656,11 +656,11 @@ if current_stage == "mold_concept":
             stl_raw = uploaded_file.getvalue()
             with open(file_path, "wb") as f:
                 f.write(stl_raw)
-            # [FIX-2] 전역 session_state에 저장 → Flow Analysis 탭에서 재업로드 불필요
+            # [FIX-2] Save globally so re-upload is not needed in Flow Analysis tab
             st.session_state["stl_bytes"] = stl_raw
             st.session_state["stl_name"]  = uploaded_file.name
             st.session_state["uploaded_stl_path"] = file_path
-            st.session_state["_stl_mesh_cache"] = None  # 캐시 초기화
+            st.session_state["_stl_mesh_cache"] = None  # reset cache
             st.success(f"✅ Upload successful: {uploaded_file.name}")
 
             if st.button("🔍 Run Analysis", type="primary", use_container_width=True):
@@ -681,13 +681,13 @@ if current_stage == "mold_concept":
                                 "parting": parting_result,
                                 "design": design_result,
                             })
-                            # ── Feasibility Gate 자동 연동 ──────────────────
+                            # ── Auto-link to Feasibility Gate ──────────────────
                             geo = model_result["geometry"]
                             _bounds = geo.get("bounds", {})
                             _sx = _bounds.get("size_x", 0)
                             _sy = _bounds.get("size_y", 0)
                             _sz = _bounds.get("size_z", 0)
-                            # flow_length ≈ 대각선 최대 길이
+                            # flow_length ≈ max diagonal length
                             _flow_len = float(np.sqrt(_sx**2 + _sy**2 + _sz**2)) * 0.5
                             st.session_state["stl_derived"] = {
                                 "min_thickness": round(_sz * 0.08, 2) if _sz > 0 else 1.8,
@@ -847,7 +847,7 @@ elif current_stage == "stage0":
     st.markdown(f'<div class="stage-desc">{T["st0_desc"]}</div>', unsafe_allow_html=True)
     st.markdown("")
 
-    # ── STL 분석 결과 자동 연동 안내 ─────────────────────
+    # ── Auto-link notice from STL analysis results ─────────────────────
     derived = st.session_state.get("stl_derived")
     if derived:
         st.success("✅ Geometry parameters auto-filled from Mold Concept STL analysis. You can adjust if needed.")
@@ -868,9 +868,9 @@ elif current_stage == "stage0":
 
     with col_b:
         st.markdown(f"#### {T['input_mold']}")
-        # gate_count: 기본값 1, 수동 수정 가능
+        # gate_count: default 1, manually adjustable
         gate_count = st.number_input(T["gate_count"], 1, 8, 1, 1)
-        # undercut: STL에서 자동 반영
+        # undercut: auto-populated from STL analysis
         undercut   = st.checkbox(T["has_undercut"],
                                  value=bool(derived["undercut"]) if derived else False)
         part_vol   = st.number_input(T["part_volume"], 0.1, 500.0,
@@ -917,17 +917,17 @@ elif current_stage == "stage0":
 
         st.markdown("#### 📋 Detailed Results by Item")
         df_items = pd.DataFrame(res["items"])
-        rename_map = {"Item":"항목","Value":"측정값","Reference":"기준값","Verdict":"판정","Action":"권장 조치"}
+        rename_map = {"Item":"Item","Value":"Measured Value","Reference":"Reference","Verdict":"Verdict","Action":"Recommended Action"}
         df_items = df_items.rename(columns=rename_map)
-        if "판정" in df_items.columns:
-            df_items.insert(0, "", df_items["판정"].apply(verdict_color))
-        display_cols = [c for c in ["","항목","측정값","기준값","판정","권장 조치"] if c in df_items.columns]
+        if "Verdict" in df_items.columns:
+            df_items.insert(0, "", df_items["Verdict"].apply(verdict_color))
+        display_cols = [c for c in ["","Item","Measured Value","Reference","Verdict","Recommended Action"] if c in df_items.columns]
         st.dataframe(df_items[display_cols], use_container_width=True, hide_index=True)
 
         if overall != "FAIL":
             st.success("✅ Manufacturability Confirmed")
             st.divider()
-            # ── Flow Analysis 링크 카드 ─────────────────
+            # ── Flow Analysis link card ─────────────────
             st.markdown("#### 🌊 Flow Analysis — Next Step")
             st.markdown("""
             <div class="link-card">
@@ -967,45 +967,45 @@ elif current_stage == "stage1":
             st.markdown("""
             **Step 1:** Run simulation at
             [🚀 MIM-Ops Pro](https://openfoam-injection-automation.streamlit.app/)
-            → 시뮬레이션 완료 후 돌아오세요.
+            → Return here after the simulation completes.
 
-            **Step 2:** Signal ID를 아래에 입력하고 **Generate CSV** 클릭.
+            **Step 2:** Enter the Signal ID below and click **Generate CSV**.
             """)
 
-            with st.expander("❓ Signal ID는 어디서 확인하나요?", expanded=False):
+            with st.expander("❓ Where can I find my Signal ID?", expanded=False):
                 st.markdown("""
-                GitHub `OpenFOAM-Injection-Automation` 저장소 → **Actions** 탭
-                → 완료된 워크플로 클릭 → Artifacts 섹션에서 이름 확인:
+                GitHub `OpenFOAM-Injection-Automation` repository → **Actions** tab
+                → Click a completed workflow → Find the name in the Artifacts section:
                 ```
                 simulation-47664275
                 ```
-                아래 형식 **모두 동작**합니다:
+                **All of the following formats work:**
 
-                | 입력 형식 | 예시 |
+                | Input Format | Example |
                 |---|---|
-                | 숫자 ID만 | `47664275` |
-                | 전체 아티팩트 이름 | `simulation-47664275` |
-                | 가장 최근 결과 자동 선택 | `latest` |
+                | Number ID only | `47664275` |
+                | Full artifact name | `simulation-47664275` |
+                | Auto-select latest result | `latest` |
                 """)
 
-            # ── 진단 버튼 ──────────────────────────────────────────
-            if st.button("🔍 아티팩트 목록 확인", help="GitHub에서 실제 아티팩트 목록을 가져와 Signal ID를 직접 확인합니다"):
+            # ── Diagnostic button ──────────────────────────────────────────
+            if st.button("🔍 Check Artifact List", help="Fetch the actual artifact list from GitHub to find your Signal ID directly"):
 
                 def _fetch_artifacts_direct(per_page: int = 50) -> list:
-                    """GitHub API로 artifacts 목록 직접 조회."""
+                    """Directly fetch artifact list via GitHub API."""
                     try:
-                        # 1. 토큰 및 설정 로드
+                        # 1. Load token and settings
                         token = st.secrets["GITHUB_TOKEN"]
                         
-                        # 요청하신대로 workshopcompany와 해당 레포지토리로 설정
-                        # secrets에 설정값이 있으면 그것을 쓰고, 없으면 기본값(workshopcompany)을 사용합니다.
+                        # Use workshopcompany and specified repo as configured
+                        # Use secret values if available, otherwise fall back to defaults (workshopcompany)
                         owner = st.secrets.get("OPENFOAM_REPO_OWNER") or st.secrets.get("REPO_OWNER") or "workshopcompany"
                         repo  = st.secrets.get("OPENFOAM_REPO_NAME") or st.secrets.get("REPO_NAME") or "OpenFOAM-Injection-Automation"
                         
                     except (KeyError, FileNotFoundError):
                         raise RuntimeError("GITHUB_TOKEN not found in secrets.")
 
-                    # 2. GitHub API 호출 (최신순 조회를 위해 per_page 상향)
+                    # 2. Call GitHub API (increase per_page for latest-first results)
                     url = f"https://api.github.com/repos/{owner}/{repo}/actions/artifacts"
                     headers = {
                         "Authorization": f"Bearer {token}",
@@ -1014,7 +1014,7 @@ elif current_stage == "stage1":
                     }
                     
                     try:
-                        # 최신 아티팩트를 먼저 확인하기 위해 쿼리 매개변수 확인
+                        # Check query parameters to fetch latest artifacts first
                         resp = requests.get(url, headers=headers, params={"per_page": per_page}, timeout=10)
                         
                         if resp.status_code == 401:
@@ -1027,8 +1027,8 @@ elif current_stage == "stage1":
                     except requests.exceptions.RequestException as e:
                         raise RuntimeError(f"GitHub connection failed: {str(e)}")
 
-                # --- 버튼 클릭 시 실행 로직 ---
-                if not _check_github_secrets(): # 기존 코드에 있는 체크 함수 호출
+                # --- Logic executed on button click ---
+                if not _check_github_secrets(): # call existing check function
                     _show_github_token_guide()
                 else:
                     try:
@@ -1039,10 +1039,10 @@ elif current_stage == "stage1":
                             st.success(f"✅ Found {len(artifacts)} simulation result(s)")
                             st.info("Copy the value after 'simulation-' (e.g. cf22322a) from the Artifact Name column and use it as your Signal ID.")
                             
-                            # 사용자에게 보여줄 데이터 프레임 구성
+                            # Build display DataFrame for user
                             display_data = []
                             for a in artifacts:
-                                # 'simulation-'으로 시작하는 파일만 필터링하거나 강조할 수 있습니다.
+                                # Can filter or highlight entries starting with 'simulation-'
                                 display_data.append({
                                     "Artifact Name": a["name"],
                                     "Created At": a["created_at"].replace("T", " ").replace("Z", ""),
@@ -1058,18 +1058,18 @@ elif current_stage == "stage1":
                         st.error(str(e))
                         _show_github_token_guide()
                     except Exception as e:
-                        st.error(f"❌ 예상치 못한 오류: {e}")
+                        st.error(f"❌ Unexpected error: {e}")
 
             st.divider()
 
-            # ── Signal ID 입력 & CSV 생성 ──────────────────────────
+            # ── Signal ID input & CSV generation ──────────────────────────
             sig_col1, sig_col2 = st.columns([3, 1])
             with sig_col1:
                 signal_id = st.text_input(
                     "Signal ID (from MIM-Ops simulation)",
                     value=st.session_state.get("github_sim_signal_id", ""),
-                    placeholder="예: 47664275  또는  simulation-47664275  또는  latest",
-                    help="숫자 ID, 전체 아티팩트 이름, 또는 'latest' 입력 가능",
+                    placeholder="e.g. 47664275  or  simulation-47664275  or  latest",
+                    help="Enter a numeric ID, full artifact name, or 'latest'",
                 )
             with sig_col2:
                 st.write("")
@@ -1078,7 +1078,7 @@ elif current_stage == "stage1":
 
             if gen_btn:
                 if not signal_id.strip():
-                    st.warning("Signal ID를 입력하세요. 모르면 위 '아티팩트 목록 확인' 버튼을 먼저 누르세요.")
+                    st.warning("Please enter a Signal ID. If unknown, click 'Check Artifact List' above first.")
                 else:
                     _github_ok = _check_github_secrets()
                     if not _github_ok:
@@ -1091,54 +1091,54 @@ elif current_stage == "stage1":
                                 st.session_state["github_sim_signal_id"] = signal_id.strip()
                                 st.session_state["flow_csv_ready"] = True
                                 st.success(
-                                    f"✅ 로드 완료! {len(cae_df):,}개 포인트 | "
-                                    f"재료: {cae_df['material'].iloc[0]} | "
-                                    f"최대 압력: {cae_df['pressure'].max():.1f} MPa"
+                                    f"✅ Loaded! {len(cae_df):,} points | "
+                                    f"Material: {cae_df['material'].iloc[0]} | "
+                                    f"Max Pressure: {cae_df['pressure'].max():.1f} MPa"
                                 )
                             except FileNotFoundError as e:
                                 st.error(str(e))
                             except Exception as e:
                                 _emsg = str(e)
-                                st.error(f"❌ 오류: {_emsg}")
+                                st.error(f"❌ Error: {_emsg}")
                                 if "GITHUB_TOKEN" in _emsg or "token" in _emsg.lower():
                                     _show_github_token_guide()
 
             if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
                 df_preview = st.session_state["cae_df"]
-                st.markdown("**데이터 미리보기 (상위 5행)**")
+                st.markdown("**Data Preview (first 5 rows)**")
                 st.dataframe(df_preview.head(5), use_container_width=True)
                 col_s1, col_s2, col_s3 = st.columns(3)
-                col_s1.metric("총 포인트", f"{len(df_preview):,}")
-                col_s2.metric("최대 압력", f"{df_preview['pressure'].max():.1f} MPa")
-                col_s3.metric("충진 시간", f"{df_preview['fill_time'].max():.3f} s")
+                col_s1.metric("Total Points", f"{len(df_preview):,}")
+                col_s2.metric("Max Pressure", f"{df_preview['pressure'].max():.1f} MPa")
+                col_s3.metric("Fill Time", f"{df_preview['fill_time'].max():.3f} s")
                 csv_bytes = df_preview.to_csv(index=False).encode("utf-8-sig")
-                st.download_button("💾 CSV 다운로드", csv_bytes, "flow_analysis.csv", "text/csv",
+                st.download_button("💾 Download CSV", csv_bytes, "flow_analysis.csv", "text/csv",
                                    use_container_width=True)
 
-        # ── Option B: 수동 CSV 업로드 ────────────────────────────────
+        # ── Option B: Manual CSV Upload ────────────────────────────────
         with st.expander("📄 Option B — Manual CSV Upload"):
             st.markdown("""
-            **필수 컬럼:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
-            `z` 컬럼은 선택 (있으면 3D 시각화)
+            **Required columns:** `x, y, pressure(MPa), temperature(°C), fill_time(s)`
+            `z` is optional (enables 3D visualization when present)
             """)
-            uploaded = st.file_uploader(T.get("select_cae_file", "CAE CSV 파일 선택"), type=["csv"])
+            uploaded = st.file_uploader(T.get("select_cae_file", "Select CAE CSV File"), type=["csv"])
             use_sample = st.checkbox(T["use_sample"], value=False)
-            # ── Option B: CSV 업로드 시 즉시 session_state에 저장 ──
+            # ── Option B: Save to session_state immediately on CSV upload ──
             if uploaded and not use_sample:
                 try:
                     _df_b = load_cae_data(uploaded)
                     st.session_state["cae_df"] = _df_b
                     st.session_state["flow_csv_ready"] = True
-                    st.success(f"✅ CSV 로드 완료! {len(_df_b):,}개 포인트 | 최대 압력: {_df_b['pressure'].max():.1f} MPa")
+                    st.success(f"✅ CSV loaded! {len(_df_b):,} points | Max pressure: {_df_b['pressure'].max():.1f} MPa")
                 except Exception as _e:
-                    st.error(f"CSV 파싱 오류: {_e}")
+                    st.error(f"CSV parse error: {_e}")
 
-        # ── Option C: VTK 파일 직접 업로드 (FIX-1 + FIX-3) ─────────
-        with st.expander("🗂️ Option C — VTK/VTU 파일 직접 업로드 (OpenFOAM 결과)", expanded=False):
+        # ── Option C: Direct VTK/VTU Upload (FIX-1 + FIX-3) ─────────
+        with st.expander("🗂️ Option C — Direct VTK/VTU Upload (OpenFOAM Results)", expanded=False):
             st.markdown("""
-            **OpenFOAM `foamToVTK` 결과물을 직접 업로드하세요.**
-            - **ZIP 파일** (`internal.vtu` 포함): 시뮬레이션 결과 폴더 전체를 압축한 .zip
-            - **단일 VTU 파일** (`internal.vtu`): 내부 솔리드 메쉬 데이터
+            **Upload your OpenFOAM `foamToVTK` output directly.**
+            - **ZIP file** (containing `internal.vtu`): the full simulation result folder zipped
+            - **Single VTU file** (`internal.vtu`): internal solid mesh data
 
             > 📌 Uploading will auto-generate a CSV from actual OpenFOAM computed values (pressure p, velocity U, etc.).
             """)
@@ -1146,14 +1146,14 @@ elif current_stage == "stage1":
             vtk_col1, vtk_col2 = st.columns([3, 1])
             with vtk_col1:
                 vtk_upload = st.file_uploader(
-                    "VTK 결과 파일 선택",
+                    "Select VTK Result File",
                     type=["zip", "vtu", "vtm", "vtp"],
                     key="vtk_direct_uploader",
-                    help="ZIP: 폴더 전체 압축 | .vtu: internal.vtu 개별 업로드",
+                    help="ZIP: full folder zipped | .vtu: upload internal.vtu individually",
                 )
             with vtk_col2:
                 st.write(""); st.write("")
-                vtk_gen_btn = st.button("🔄 VTK → CSV 변환", key="vtk_gen_btn",
+                vtk_gen_btn = st.button("🔄 Convert VTK → CSV", key="vtk_gen_btn",
                                         use_container_width=True, type="primary")
 
             if vtk_upload and vtk_gen_btn:
@@ -1166,42 +1166,42 @@ elif current_stage == "stage1":
                         else:  # .vtu / .vtm / .vtp
                             _vtk_df = parse_vtu_to_dataframe(raw, material=material)
 
-                        # 세션 저장 + solid mesh 별도 저장
+                        # Save to session + separate save for solid mesh
                         st.session_state["cae_df"]        = _vtk_df
                         st.session_state["flow_csv_ready"] = True
-                        st.session_state["vtk_solid_df"]  = _vtk_df  # Solid Mesh 탭용
+                        st.session_state["vtk_solid_df"]  = _vtk_df  # for Solid Mesh tab
                         st.success(
-                            f"✅ VTK 파싱 완료! **{len(_vtk_df):,}개 포인트** | "
-                            f"최대 압력: {_vtk_df['pressure'].max():.3f} MPa | "
-                            f"파일: {vtk_upload.name}"
+                            f"✅ VTK parsed! **{len(_vtk_df):,} points** | "
+                            f"Max pressure: {_vtk_df['pressure'].max():.3f} MPa | "
+                            f"File: {vtk_upload.name}"
                         )
-                        # CSV 다운로드 버튼
+                        # CSV download button
                         csv_vtk = _vtk_df.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(
-                            "💾 생성된 CSV 다운로드",
+                            "💾 Download Generated CSV",
                             csv_vtk, "vtk_flow_results.csv", "text/csv",
                             use_container_width=True,
                         )
                     except Exception as _ve:
-                        st.error(f"❌ VTK 파싱 오류: {_ve}")
-                        st.info("💡 파일 형식을 확인하세요. ASCII 형식 .vtu만 지원합니다. (`foamToVTK -ascii`)")
+                        st.error(f"❌ VTK parse error: {_ve}")
+                        st.info("💡 Check the file format. Only ASCII .vtu is supported. (`foamToVTK -ascii`)")
 
-            # 이미 VTK 데이터가 로드된 경우 상태 표시
+            # Show status if VTK data is already loaded
             if st.session_state.get("vtk_solid_df") is not None:
                 _vs = st.session_state["vtk_solid_df"]
-                st.info(f"🧊 Solid Mesh 데이터 로드됨: {len(_vs):,} pts — 'Solid Mesh (VTK)' 탭에서 확인하세요.")
+                st.info(f"🧊 Solid Mesh data loaded: {len(_vs):,} pts — check the 'Solid Mesh (VTK)' tab.")
 
 
 
         use_ml = st.toggle(T["apply_ml"], value=False)
         st.divider()
 
-        # ── 현재 로드된 데이터 상태 표시 ──────────────────────────
+        # ── Display current loaded data status ──────────────────────────
         if st.session_state.get("flow_csv_ready") and st.session_state.get("cae_df") is not None:
             _loaded = st.session_state["cae_df"]
-            st.success(f"✅ 데이터 준비됨 — {len(_loaded):,}개 포인트 | 최대 압력: {_loaded['pressure'].max():.1f} MPa")
+            st.success(f"✅ Data ready — {len(_loaded):,} points | Max pressure: {_loaded['pressure'].max():.1f} MPa")
         elif not st.session_state.get("flow_csv_ready"):
-            st.info("💡 위에서 Signal ID로 CSV 생성하거나, Option B로 CSV를 업로드한 뒤 분석을 실행하세요.")
+            st.info("💡 Generate a CSV using a Signal ID above, or upload a CSV via Option B, then run analysis.")
 
         if st.button(T["btn_st1"], type="primary", use_container_width=True):
             with st.spinner(T.get("st1_analyzing", "Analyzing...")):
@@ -1210,9 +1210,9 @@ elif current_stage == "stage1":
                     if cae_df is None:
                         if use_sample:
                             cae_df = generate_sample_cae_csv(n_points=300, material=material)
-                            st.info(f"📌 {T.get('msg_using_sample', '샘플 데이터로 분석합니다.')}")
+                            st.info(f"📌 {T.get('msg_using_sample', 'Analyzing with sample data.')}")
                         else:
-                            st.warning("⚠️ 데이터가 없습니다. Signal ID로 CSV를 생성하거나 Option B로 업로드하세요.")
+                            st.warning("⚠️ No data available. Generate CSV with a Signal ID or upload via Option B.")
                             st.stop()
 
                     analysis = analyze_cae(cae_df, material=material)
@@ -1224,18 +1224,18 @@ elif current_stage == "stage1":
                 except Exception as e:
                     st.error(f"{T['msg_error']}: {e}")
 
-    # ── 결과 탭들 ─────────────────────────────────────────
+    # ── Result tabs ─────────────────────────────────────────
     if st.session_state["cae_analysis"]:
         analysis = st.session_state["cae_analysis"]
         cae_df   = st.session_state["cae_df"]
         stats    = analysis["stats"]
 
         # ══════════════════════════════════════════════════════
-        #  STL 파싱 유틸 (trimesh 없이 순수 stdlib + numpy)
+        #  STL parse utility (pure stdlib + numpy, no trimesh)
         # ══════════════════════════════════════════════════════
         def _parse_stl_binary(file_bytes: bytes):
             """Binary STL → (vertices Nx3, faces Mx3) numpy arrays.
-            중복 vertex를 제거해 Mesh3d의 i/j/k 인덱스를 올바르게 반환."""
+            Deduplicate vertices and return correct i/j/k indices for Mesh3d."""
             import struct
             data = file_bytes
             # 80 byte header + 4 byte tri count
@@ -1250,7 +1250,7 @@ elif current_stage == "stage1":
                 offset += 2   # attr byte
                 raw_verts.extend([v0, v1, v2])
             verts_all = np.array(raw_verts, dtype=np.float64)  # (3*N, 3)
-            # 중복 제거 → 인덱스 배열 생성
+            # Deduplicate → build index array
             verts_unique, inv_idx = np.unique(
                 np.round(verts_all, 6), axis=0, return_inverse=True
             )
@@ -1258,16 +1258,16 @@ elif current_stage == "stage1":
             return verts_unique, faces
 
         def _map_cae_to_mesh(vertices, cae_df, field, gate_pos):
-            """각 mesh vertex에 CAE 포인트의 field 값을 XY 기반 IDW로 매핑.
-            판형 파트는 Z 정규화가 거리를 왜곡하므로 XY 평면만 사용.
-            [FIX] k=8 → k=min(20, n) 으로 증가 + IDW power=3 으로 높여 날카로운 경계 감소"""
+            """Map CAE point field values to each mesh vertex using XY-based IDW.
+            Use only XY plane — Z normalization distorts distances on flat parts.
+            [FIX] k=8 → k=min(20, n) increased + IDW power=3 to reduce sharp boundaries"""
             cae_xy  = cae_df[["x", "y"]].values.astype(float)
             cae_vals = cae_df[field].values.astype(float)
 
             # STL vertex XY
             verts_xy = vertices[:, :2]
 
-            # XY bounding box 정규화
+            # XY bounding box normalization
             v_min = verts_xy.min(axis=0);  v_max = verts_xy.max(axis=0)
             c_min = cae_xy.min(axis=0);    c_max = cae_xy.max(axis=0)
             v_range = np.where((v_max - v_min) > 0, v_max - v_min, 1.0)
@@ -1275,9 +1275,9 @@ elif current_stage == "stage1":
             vn = (verts_xy - v_min) / v_range
             cn = (cae_xy   - c_min) / c_range
 
-            # [FIX] k 를 최대 20개로 늘려 보간 경계 부드럽게
+            # [FIX] Increase k to max 20 for smoother interpolation boundaries
             k = min(20, len(cn))
-            idw_power = 2  # 제곱 역거리 (너무 높으면 뾰족해짐)
+            idw_power = 2  # inverse distance squared (too high → sharp artifacts)
             intensity = np.empty(len(vn))
             for vi in range(len(vn)):
                 dists = np.linalg.norm(cn - vn[vi], axis=1)
@@ -1308,14 +1308,14 @@ elif current_stage == "stage1":
             colorscales = {"pressure": "Jet", "temperature": "Hot", "fill_time": "Viridis"}
             cb_titles   = {"pressure": "Pressure (MPa)", "temperature": "Temp (°C)", "fill_time": "Fill Time (s)"}
 
-            # ── 게이트 위치 ──────────────────────────────────────
+            # ── Gate position ──────────────────────────────────────
             has_z_global = "z" in cae_df.columns
             gate_row = cae_df.loc[cae_df["fill_time"].idxmin()]
             gate_x = float(gate_row["x"])
             gate_y = float(gate_row["y"])
             gate_z = float(gate_row["z"]) if has_z_global else 0.0
 
-            # 게이트 거리 / 유동선단
+            # Gate distance / flow front
             if has_z_global:
                 cae_df["dist_from_gate"] = np.sqrt(
                     (cae_df["x"] - gate_x)**2 + (cae_df["y"] - gate_y)**2 + (cae_df["z"] - gate_z)**2)
@@ -1326,10 +1326,10 @@ elif current_stage == "stage1":
             cae_df["rel_dist"] = cae_df["dist_from_gate"] / max_dist
             front_df = cae_df[cae_df["rel_dist"] > 0.85]
 
-            # ── STL 파싱 (session_state 캐시) ───────────────────
+            # ── STL parsing (session_state cache) ───────────────────
             stl_mesh_data = st.session_state.get("_stl_mesh_cache")
 
-            # [FIX-2] Mold Concept에서 업로드된 STL 자동 로드
+            # [FIX-2] Auto-load STL uploaded from Mold Concept
             auto_stl_bytes = st.session_state.get("stl_bytes")
             if auto_stl_bytes is not None and stl_mesh_data is None:
                 with st.spinner("🔄 Auto-loading STL from Mold Concept..."):
@@ -1342,24 +1342,24 @@ elif current_stage == "stage1":
                         }
                         stl_mesh_data = st.session_state["_stl_mesh_cache"]
                         st.success(
-                            f"✅ STL 자동 로드 완료: **{st.session_state.get('stl_name')}** "
+                            f"✅ STL auto-loaded: **{st.session_state.get('stl_name')}** "
                             f"({len(_av):,} vertices, {len(_af):,} faces)"
                         )
                     except Exception as _ae:
-                        st.warning(f"STL 자동 로드 실패 (수동 업로드 필요): {_ae}")
+                        st.warning(f"STL auto-load failed (manual upload required): {_ae}")
 
-            # STL 수동 업로드 위젯 (자동 로드가 안 됐을 때만 강조 표시)
+            # STL manual upload widget (highlighted only when auto-load failed)
             stl_col1, stl_col2 = st.columns([3, 1])
             with stl_col1:
                 _uploader_label = (
                     "🗂️ Upload STL File (overlay contour on geometry)"
                     if stl_mesh_data is None
-                    else "🔄 다른 STL로 교체하려면 업로드"
+                    else "🔄 Upload to replace with a different STL"
                 )
                 stl_upload_field = st.file_uploader(
                     _uploader_label,
                     type=["stl"], key="stl_field_uploader",
-                    help="Mold Concept에서 업로드한 STL이 자동으로 로드됩니다. 다른 파일로 교체할 경우만 업로드.",
+                    help="The STL uploaded in Mold Concept is auto-loaded. Only upload here to replace it.",
                 )
             with stl_col2:
                 st.write("")
@@ -1380,11 +1380,11 @@ elif current_stage == "stage1":
                             "intensity_cache": {},  # field → array
                         }
                         stl_mesh_data = st.session_state["_stl_mesh_cache"]
-                        st.success(f"✅ STL 로드 완료: {len(verts):,} vertices, {len(faces):,} faces")
+                        st.success(f"✅ STL loaded: {len(verts):,} vertices, {len(faces):,} faces")
                     except Exception as _stl_e:
-                        st.error(f"STL 파싱 오류: {_stl_e}")
+                        st.error(f"STL parse error: {_stl_e}")
 
-            # ── 공통 scene / layout ──────────────────────────────
+            # ── Common scene / layout ──────────────────────────────
             _scene_cfg = dict(
                 xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
                 bgcolor="#111318",
@@ -1425,21 +1425,21 @@ elif current_stage == "stage1":
                     fig3d = go.Figure()
 
                     # ══════════════════════════════════════════════════════
-                    #  Cell Mesh를 STL 유무와 관계없이 항상 기본 렌더링
-                    #  셀 크기 목표 = avg_thickness / 10
-                    #  (STL이 있으면 투명 윤곽선으로 오버레이만 추가)
+                    #  Always render Cell Mesh regardless of STL availability
+                    #  Target cell size = avg_thickness / 10
+                    #  (If STL present, add transparent outline as overlay)
                     # ══════════════════════════════════════════════════════
                     _avg_t = float(st.session_state.get("avg_thickness", 2.4))
 
                     def _build_cell_mesh(df_in, field_col, avg_thickness=2.4, stl_verts=None):
                         """
-                        CAE 포인트 → 복셀 Cell Mesh.
-                        셀 크기 = avg_thickness / 10  (사용자 설정 두께 기준)
-                        총 셀 수 500,000개 이하로 clamp (고해상도 렌더링)
-                        stl_verts 제공 시: STL XY 풋프린트 Delaunay 마스킹
-                        STL 없을 때: CAE 포인트 알파셰이프(concave hull) 마스킹으로 삐져나옴 방지
-                        [FIX] cx_/cy_ 를 마스킹 코드 *전*에 정의 (NameError 버그 수정)
-                        [FIX] 셀 상한 80k→500k, Z는 2층으로 고정하여 XY 해상도 극대화
+                        CAE points → voxel Cell Mesh.
+                        Cell size = avg_thickness / 10  (based on user thickness setting)
+                        Clamp total cells to 500,000 or below (high-resolution rendering)
+                        If stl_verts provided: Delaunay masking on STL XY footprint
+                        Otherwise: CAE point Delaunay masking to prevent bleed-out
+                        [FIX] Define cx_/cy_ *before* masking code (fixes NameError bug)
+                        [FIX] Cell limit 80k→500k, Z fixed to 2 layers to maximize XY resolution
                         """
                         _df = df_in.copy()
                         if len(_df) == 0:
@@ -1452,7 +1452,7 @@ elif current_stage == "stage1":
                         z_range  = float(z_arr.max() - z_arr.min())
                         xy_range = max(float(x_arr.max()-x_arr.min()), float(y_arr.max()-y_arr.min()), 1e-6)
 
-                        # 얇은 파트: z를 두께의 절반만큼 위아래로 분리 (최소 2층 확보)
+                        # Thin part: split z by half-thickness up/down (ensure min 2 layers)
                         if z_range < xy_range * 0.05:
                             z_mid  = float(z_arr.mean())
                             z_half = max(z_range * 0.5, avg_thickness * 0.5)
@@ -1462,16 +1462,16 @@ elif current_stage == "stage1":
                         y_span = float(y_arr.max()-y_arr.min()) or 1.0
                         z_span = float(z_arr.max()-z_arr.min()) or 1.0
 
-                        # ── 두께 기반 셀 크기 계산 ──────────────────────────
-                        # 목표 셀 크기: avg_thickness / 10 (최소 0.03 mm)
+                        # ── Thickness-based cell size calculation ──────────────────────────
+                        # Target cell size: avg_thickness / 10 (min 0.03 mm)
                         target_cell = max(0.03, avg_thickness / 10.0)
                         nx_raw = max(8,  int(x_span / target_cell))
                         ny_raw = max(8,  int(y_span / target_cell))
-                        # Z는 얇은 파트에서 2층으로 고정 → XY 해상도 극대화
+                        # Z fixed to 2 layers for thin parts → maximize XY resolution
                         nz_raw = max(2,  int(max(z_span, target_cell) / target_cell))
 
-                        # 총 셀 500,000 이하 clamp (80k→500k 상향으로 해상도 개선)
-                        # Z는 최대 4층으로 제한해 XY 해상도 우선
+                        # Clamp total cells to 500,000 (resolution improved from 80k→500k)
+                        # Limit Z to max 4 layers to prioritize XY resolution
                         nz_raw = min(nz_raw, 4)
                         total = nx_raw * ny_raw * nz_raw
                         if total > 500000:
@@ -1505,13 +1505,13 @@ elif current_stage == "stage1":
                                         ss+=np.where(v,sl,0); sc+=v.astype(float)
                             fm=empty&(sc>0); vox_val[fm]=ss[fm]/sc[fm]
 
-                        # ── [FIX] cx_/cy_ 를 마스킹 전에 먼저 계산 ──────────
+                        # ── [FIX] Compute cx_/cy_ before masking ──────────
                         cx_=(x_bins[:-1]+x_bins[1:])/2
                         cy_=(y_bins[:-1]+y_bins[1:])/2
 
-                        # ── XY 풋프린트 마스킹 (형상 밖 셀 제거) ─────────────
-                        # 우선순위 1: STL 꼭짓점 Delaunay
-                        # 우선순위 2: CAE 포인트 Delaunay (STL 없을 때 삐져나옴 방지)
+                        # ── XY footprint masking (remove cells outside geometry) ─────────────
+                        # Priority 1: STL vertex Delaunay
+                        # Priority 2: CAE point Delaunay (prevent bleed-out when no STL)
                         if stl_verts is not None and len(stl_verts) >= 4:
                             _mask_xy = stl_verts[:, :2].astype(np.float64)
                         else:
@@ -1524,7 +1524,7 @@ elif current_stage == "stage1":
                             _inside  = (_dln.find_simplex(_test_xy) >= 0).reshape(nx, ny)
                             vox_val[~_inside, :] = np.nan
                         except Exception:
-                            pass  # scipy 없거나 실패 시 마스킹 생략
+                            pass  # skip masking if scipy unavailable or error
                         cz_=(z_bins[:-1]+z_bins[1:])/2
                         dx2=(x_bins[1]-x_bins[0])/2; dy2=(y_bins[1]-y_bins[0])/2; dz2=(z_bins[1]-z_bins[0])/2
                         face_defs=[
@@ -1561,43 +1561,43 @@ elif current_stage == "stage1":
                             "nx":nx, "ny":ny, "nz":nz,
                         }
 
-                    # ── 렌더링 모드 선택 ────────────────────────────────
+                    # ── Render mode selection ────────────────────────────────
                     render_mode = st.radio(
-                        "🎨 렌더링 모드",
-                        ["🟦 Cell Mesh (Voxel)", "🔵 Scatter Point Cloud (고밀도)"],
+                        "🎨 Render Mode",
+                        ["🟦 Cell Mesh (Voxel)", "🔵 Scatter Point Cloud (High-density)"],
                         horizontal=True,
                         key=f"render_mode_{ft}",
-                        help="Cell Mesh(권장): 복셀 격자 방식 — 꽉 찬 솔리드, 멈춤 없음 | Scatter: 고밀도 포인트 클라우드",
+                        help="Cell Mesh (recommended): voxel grid — solid fill, no freeze | Scatter: high-density point cloud",
                     )
                     use_delaunay = render_mode.startswith("🔵")
 
                     if use_delaunay:
                         # ════════════════════════════════════════════════
-                        #  고밀도 Scatter3d 렌더링
-                        #  · Mesh3d alphahull 방식 완전 대체
-                        #  · 10,000~15,000pt 에서도 브라우저 멈춤 없음
-                        #  · 마커 크기를 키워 "꽉 찬 솔리드" 느낌 구현
+                        #  High-density Scatter3d rendering
+                        #  · Fully replaces Mesh3d alphahull approach
+                        #  · No browser freeze even at 10,000~15,000 pts
+                        #  · Larger markers create a solid-fill appearance
                         # ════════════════════════════════════════════════
                         sc_col1, sc_col2 = st.columns(2)
                         with sc_col1:
                             scatter_n = st.slider(
-                                "포인트 수",
+                                "Point Count",
                                 min_value=3000,
                                 max_value=15000,
                                 value=10000,
                                 step=1000,
                                 key=f"scatter_n_{ft}",
-                                help="많을수록 정밀하지만 렌더링이 다소 느려집니다. 10,000이 최적입니다.",
+                                help="More points = more detail, but slower rendering. 10,000 is optimal.",
                             )
                         with sc_col2:
                             scatter_size = st.slider(
-                                "마커 크기 (밀도감)",
+                                "Marker Size (density)",
                                 min_value=2,
                                 max_value=8,
                                 value=4,
                                 step=1,
                                 key=f"scatter_size_{ft}",
-                                help="크게 할수록 구멍이 줄고 솔리드처럼 보입니다. 4~5 권장.",
+                                help="Larger values reduce gaps and create a more solid look. 4~5 recommended.",
                             )
 
                         _dl_n = min(len(cae_df), scatter_n)
@@ -1614,7 +1614,7 @@ elif current_stage == "stage1":
                                 color=vdf[ft].values,
                                 colorscale=colorscales[ft],
                                 opacity=1.0,
-                                line=dict(width=0),   # 테두리 제거 → 점들이 뭉쳐 매끄러워짐
+                                line=dict(width=0),   # remove border → points merge smoothly
                                 colorbar=dict(
                                     title=dict(text=cb_titles[ft], font=dict(color="#e2e8f0")),
                                     tickfont=dict(color="#e2e8f0"), x=1.02,
@@ -1628,7 +1628,7 @@ elif current_stage == "stage1":
                             ),
                         ))
 
-                        # STL 투명 윤곽선 오버레이 (형상 참고용)
+                        # Transparent STL outline overlay (geometry reference)
                         if stl_mesh_data is not None:
                             _sv = stl_mesh_data["vertices"]
                             _sf = stl_mesh_data["faces"]
@@ -1641,14 +1641,14 @@ elif current_stage == "stage1":
                             ))
 
                         st.caption(
-                            f"🔵 Point Cloud: **{_dl_n:,}pts** | 마커 크기 {scatter_size}"
-                            + (" | +STL 윤곽선" if stl_mesh_data else "")
+                            f"🔵 Point Cloud: **{_dl_n:,}pts** | Marker size {scatter_size}"
+                            + (" | +STL Outline" if stl_mesh_data else "")
                         )
                         _title_mode = f"Point Cloud ({_dl_n:,}pts)"
 
                     else:
                         # ════════════════════════════════════════════════
-                        #  Cell Mesh (Voxel) 렌더링 — 기존 방식 유지
+                        #  Cell Mesh (Voxel) rendering — original approach
                         # ════════════════════════════════════════════════
                         _stl_verts_for_mask = stl_mesh_data["vertices"] if stl_mesh_data is not None else None
                         with st.spinner(f"🔄 Building Cell Mesh (cell ≈ {_avg_t/10:.2f} mm)..."):
@@ -1679,12 +1679,12 @@ elif current_stage == "stage1":
                                 f"📐 Grid: **{cell_data['nx']} × {cell_data['ny']} × {cell_data['nz']}** cells"
                                 f" | cell size ≈ **{_cs:.3f} mm**"
                                 f" (avg_thickness {_avg_t:.1f} mm ÷ 10)"
-                                + (f" | ✂️ STL 마스킹" if stl_mesh_data else f" | ✂️ CAE 경계 마스킹")
+                                + (f" | ✂️ STL masking" if stl_mesh_data else f" | ✂️ CAE boundary masking")
                             )
                         else:
                             st.warning("Cell mesh generation failed — check data.")
 
-                        # STL 투명 윤곽선 오버레이
+                        # Transparent STL outline overlay
                         if stl_mesh_data is not None:
                             _sv = stl_mesh_data["vertices"]
                             _sf = stl_mesh_data["faces"]
@@ -1698,7 +1698,7 @@ elif current_stage == "stage1":
 
                         _title_mode = f"Cell Mesh — {_avg_t/10:.2f} mm/cell"
 
-                    # ── 유동선단 오버레이 (공통) ────────────────────────
+                    # ── Flow front overlay (common) ────────────────────────
                     if ft == "fill_time" and len(front_df) > 0:
                         fz = front_df["z"].values if has_z_global else np.zeros(len(front_df))
                         fig3d.add_trace(go.Scatter3d(
@@ -1708,7 +1708,7 @@ elif current_stage == "stage1":
                             name="🟢 Flow Front (>85%)", showlegend=True,
                         ))
 
-                    # 게이트 마커 공통
+                    # Gate marker (common)
                     fig3d.add_trace(_gate_trace_3d(gate_z))
 
                     fig3d.update_layout(
@@ -1730,9 +1730,9 @@ elif current_stage == "stage1":
                     col_gi1.metric("🎯 Gate Position",
                                    f"({gate_x:.2f}, {gate_y:.2f}, {gate_z:.2f}) mm")
                     col_gi2.metric("📏 Max Flow Distance", f"{max_dist:.2f} mm")
-                    col_gi3.metric("🌊 유동 선단 포인트", f"{len(front_df)}개")
+                    col_gi3.metric("🌊 Flow Front Points", f"{len(front_df)}")
 
-            # 통계 지표
+            # Statistics metrics
             c1, c2, c3, c4 = st.columns(4)
             c1.metric(T.get("metric_max_pressure",  "Max Pressure"), f"{stats['max_pressure_MPa']:.1f} MPa")
             c2.metric(T.get("metric_max_temp",       "Max Temp"),     f"{stats['max_temperature_C']:.1f} °C")
@@ -1794,11 +1794,11 @@ elif current_stage == "stage1":
 
         # ── Tab: Solid Mesh (VTK) — FIX-3 ────────────────
         with tab_solid:
-            st.markdown("#### 🧊 Solid Mesh 체적 시각화 (OpenFOAM VTK 실제 결과)")
+            st.markdown("#### 🧊 Solid Mesh Volume Visualization (Actual OpenFOAM VTK Results)")
             st.markdown("""
             <div class="info-box">
-            STL 껍데기 위에 데이터를 매핑하던 방식 대신, <b>OpenFOAM이 계산한 내부 솔리드 메쉬 데이터</b>를
-            직접 Point Cloud로 시각화합니다. 좌측 <b>Data Input → Option C</b>에서 VTK 파일을 먼저 업로드하세요.
+            Instead of mapping data onto an STL shell, this tab directly visualizes <b>OpenFOAM's computed internal solid mesh data</b>
+            as a Point Cloud. Please upload a VTK file in <b>Data Input → Option C</b> on the left first.
             </div>
             """, unsafe_allow_html=True)
 
@@ -1806,14 +1806,14 @@ elif current_stage == "stage1":
 
             if solid_df is None:
                 st.warning(
-                    "⚠️ Solid Mesh 데이터가 없습니다.\n\n"
+                    "⚠️ No Solid Mesh data available.\n\n"
                     "Upload `internal.vtu` or ZIP via **Data Input → Option C**\n"
-                    "이 탭에서 실제 OpenFOAM 체적 결과가 표시됩니다."
+                    "Actual OpenFOAM volume results will appear here."
                 )
-                # 업로드 숏컷
+                # Upload shortcut
                 st.divider()
                 _solid_shortcut = st.file_uploader(
-                    "빠른 업로드: internal.vtu 또는 결과 ZIP",
+                    "Quick upload: internal.vtu or result ZIP",
                     type=["vtu", "vtm", "zip"], key="solid_shortcut_uploader",
                 )
                 if _solid_shortcut:
@@ -1828,23 +1828,23 @@ elif current_stage == "stage1":
                             st.session_state["vtk_solid_df"] = solid_df
                             st.session_state["cae_df"] = solid_df
                             st.session_state["flow_csv_ready"] = True
-                            st.success(f"✅ {len(solid_df):,}개 포인트 로드 완료!")
+                            st.success(f"✅ {len(solid_df):,} points loaded successfully!")
                             st.rerun()
                         except Exception as _se:
                             st.error(f"❌ {_se}")
 
             if solid_df is not None:
-                # ── 필드 선택 ──────────────────────────────────────
+                # ── Field selection ──────────────────────────────────────
                 _avail_fields = [c for c in ["pressure", "temperature", "fill_time",
                                              "U_mag", "Ux", "Uy", "Uz", "p"]
                                  if c in solid_df.columns]
                 if not _avail_fields:
-                    st.error("파싱된 데이터에 시각화할 필드가 없습니다.")
+                    st.error("No visualizable fields found in the parsed data.")
                 else:
                     _field_labels = {
-                        "pressure": "압력 (MPa)", "temperature": "온도 (°C)",
-                        "fill_time": "충진시간 (s)", "U_mag": "속도 크기 (m/s)",
-                        "Ux": "X 속도", "Uy": "Y 속도", "Uz": "Z 속도", "p": "p (kinematic)",
+                        "pressure": "Pressure (MPa)", "temperature": "Temperature (°C)",
+                        "fill_time": "Fill Time (s)", "U_mag": "Velocity Magnitude (m/s)",
+                        "Ux": "X Velocity", "Uy": "Y Velocity", "Uz": "Z Velocity", "p": "p (kinematic)",
                     }
                     _solid_tabs = st.tabs([_field_labels.get(f, f) for f in _avail_fields])
                     _solid_cs = {
@@ -1853,15 +1853,15 @@ elif current_stage == "stage1":
                         "Ux": "RdBu", "Uy": "RdBu", "Uz": "RdBu", "p": "Jet",
                     }
 
-                    # 통계 메트릭
+                    # Statistics metrics
                     _mc = st.columns(4)
-                    _mc[0].metric("총 포인트", f"{len(solid_df):,}")
+                    _mc[0].metric("Total Points", f"{len(solid_df):,}")
                     if "pressure" in solid_df.columns:
-                        _mc[1].metric("최대 압력", f"{solid_df['pressure'].max():.3f} MPa")
+                        _mc[1].metric("Max Pressure", f"{solid_df['pressure'].max():.3f} MPa")
                     if "U_mag" in solid_df.columns:
-                        _mc[2].metric("최대 속도", f"{solid_df['U_mag'].max():.4f} m/s")
+                        _mc[2].metric("Max Velocity", f"{solid_df['U_mag'].max():.4f} m/s")
                     if "temperature" in solid_df.columns:
-                        _mc[3].metric("최대 온도", f"{solid_df['temperature'].max():.1f} °C")
+                        _mc[3].metric("Max Temperature", f"{solid_df['temperature'].max():.1f} °C")
 
                     for _si, _sf in enumerate(_avail_fields):
                         with _solid_tabs[_si]:
@@ -1869,18 +1869,18 @@ elif current_stage == "stage1":
                             _has_z = "z" in solid_df.columns
                             _z_col = solid_df["z"].values if _has_z else np.zeros(len(solid_df))
 
-                            # 단면 보기 (클리핑)
+                            # Cross-section view (clipping)
                             _clip_col1, _clip_col2 = st.columns([2, 1])
                             with _clip_col2:
-                                _clip_axis = st.selectbox("단면 축", ["없음(전체)", "X", "Y", "Z"],
+                                _clip_axis = st.selectbox("Section Axis", ["None (All)", "X", "Y", "Z"],
                                                            key=f"clip_axis_{_sf}")
-                                _clip_ratio = st.slider("단면 위치 (%)", 0, 100, 50,
+                                _clip_ratio = st.slider("Section Position (%)", 0, 100, 50,
                                                          key=f"clip_ratio_{_sf}",
-                                                         help="전체 범위 대비 단면 위치")
+                                                         help="Section position relative to full range")
 
                             with _clip_col1:
                                 _mask = np.ones(len(solid_df), dtype=bool)
-                                if _clip_axis != "없음(전체)":
+                                if _clip_axis != "None (All)":
                                     _ax_data = {
                                         "X": solid_df["x"].values,
                                         "Y": solid_df["y"].values,
@@ -1934,18 +1934,18 @@ elif current_stage == "stage1":
                                         text=(
                                             f"Solid Mesh — {_field_labels.get(_sf, _sf)} "
                                             f"| {_mask.sum():,}/{len(solid_df):,} pts"
-                                            + (f" [{_clip_axis} ≤ {_clip_ratio}%]" if _clip_axis != "없음(전체)" else "")
+                                            + (f" [{_clip_axis} ≤ {_clip_ratio}%]" if _clip_axis != "None (All)" else "")
                                         ),
                                         font=dict(color="#e2e8f0", size=13),
                                     ),
                                 )
                                 st.plotly_chart(_fig_solid, use_container_width=True)
 
-                    # CSV 다운로드
+                    # CSV download
                     st.divider()
                     _csv_solid = solid_df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        "📥 Solid Mesh CSV 다운로드",
+                        "📥 Download Solid Mesh CSV",
                         _csv_solid, "solid_mesh_results.csv", "text/csv",
                         use_container_width=True,
                     )
@@ -2164,14 +2164,14 @@ elif current_stage == "stage3":
         with tab_post:
             if not inv["post_correction"].empty:
                 post_df = inv["post_correction"]
-                st.dataframe(style_verdict_df(post_df, verdict_col="결과"),
+                st.dataframe(style_verdict_df(post_df, verdict_col="Result"),
                              use_container_width=True, hide_index=True)
                 if "Feature" in post_df.columns:
                     fig = go.Figure([
                         go.Bar(name=T.get("label_pre_dev","Pre-Dev."), x=post_df["Feature"],
-                               y=post_df["보정 전 편차"].abs(), marker_color="#ff6b35"),
+                               y=post_df["Pre-Deviation"].abs(), marker_color="#ff6b35"),
                         go.Bar(name=T.get("label_post_dev","Post-Dev."), x=post_df["Feature"],
-                               y=post_df["보정 후 편차"].abs(), marker_color="#00d4aa"),
+                               y=post_df["Post-Deviation"].abs(), marker_color="#00d4aa"),
                     ])
                     fig.update_layout(barmode="group", paper_bgcolor="#0a0c0f",
                                       plot_bgcolor="#111318", font_color="#e2e8f0",
